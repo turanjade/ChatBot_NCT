@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NCT Travel Demand Assistant</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg0: #0d1117;
+  --bg1: #161b22;
+  --bg2: #21262d;
+  --bg3: #30363d;
+  --text0: #e6edf3;
+  --text1: #8b949e;
+  --text2: #6e7681;
+  --green: #39d353;
+  --green-dim: #196127;
+  --blue: #58a6ff;
+  --orange: #f0883e;
+  --red: #f85149;
+  --border: #30363d;
+  --radius: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: var(--bg0); color: var(--text0); font-family: 'DM Sans', sans-serif; }
+
+/* ── Layout ── */
+.shell { display: grid; grid-template-columns: 290px 1fr; height: 100vh; overflow: hidden; }
+
+/* ── Sidebar ── */
+.sidebar {
+  background: var(--bg1);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.logo {
+  padding: 24px 20px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.logo-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--green-dim); border: 1px solid var(--green);
+  color: var(--green); font-size: 10px; font-family: 'IBM Plex Mono', monospace;
+  padding: 3px 8px; border-radius: 20px; margin-bottom: 10px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.logo-badge::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.logo h1 { font-size: 15px; font-weight: 500; color: var(--text0); line-height: 1.3; }
+.logo p  { font-size: 12px; color: var(--text1); margin-top: 2px; }
+
+/* ── Scenario panel ── */
+.scenario-panel { padding: 16px; border-bottom: 1px solid var(--border); }
+.upload-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text2); font-family: 'IBM Plex Mono', monospace; margin-bottom: 8px; display: block; }
+.perf-select {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 8px 10px; color: var(--text0);
+  font-family: 'IBM Plex Mono', monospace; font-size: 12px;
+  outline: none; cursor: pointer; margin-bottom: 8px;
+  appearance: none; -webkit-appearance: none;
+}
+.perf-select:focus { border-color: var(--green); }
+.perf-select option { background: var(--bg2); color: var(--text0); }
+.load-btn {
+  width: 100%; padding: 9px; border-radius: var(--radius);
+  background: var(--green); color: #0d1117;
+  font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 500;
+  border: none; cursor: pointer; transition: opacity 0.2s, transform 0.1s;
+}
+.load-btn:hover { opacity: 0.88; }
+.load-btn:active { transform: scale(0.98); }
+.load-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+.perf-status { font-size: 11px; font-family: 'IBM Plex Mono', monospace; color: var(--text2); margin-top: 6px; min-height: 16px; line-height: 1.5; }
+.perf-status.ok  { color: var(--green); }
+.perf-status.err { color: var(--red); }
+
+/* ── Loaded badge pills ── */
+.badge-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.badge {
+  font-size: 10px; font-family: 'IBM Plex Mono', monospace;
+  padding: 2px 7px; border-radius: 20px;
+  border: 1px solid var(--border); color: var(--text2); background: var(--bg2);
+}
+.badge.active { border-color: var(--green); color: var(--green); background: var(--green-dim); }
+
+/* ── Suggestions ── */
+.suggestions { padding: 16px; flex: 1; overflow-y: auto; }
+.suggestions-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text2); font-family: 'IBM Plex Mono', monospace; margin-bottom: 10px; display: block; }
+.chip {
+  display: block; width: 100%; text-align: left;
+  background: var(--bg2); border: 1px solid var(--border);
+  color: var(--text1); font-size: 12px; padding: 8px 10px;
+  border-radius: 6px; cursor: pointer; margin-bottom: 5px;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  font-family: 'DM Sans', sans-serif;
+}
+.chip:hover { border-color: var(--green); color: var(--green); background: rgba(57,211,83,0.06); }
+
+/* ── Main chat ── */
+.main { display: flex; flex-direction: column; overflow: hidden; }
+
+.topbar {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg1);
+}
+.topbar-left { display: flex; align-items: center; gap: 10px; }
+.topbar-status { font-size: 12px; color: var(--text1); font-family: 'IBM Plex Mono', monospace; }
+.topbar-status.ready { color: var(--green); }
+.clear-btn {
+  font-size: 12px; color: var(--text1); background: none; border: 1px solid var(--border);
+  padding: 5px 12px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans', sans-serif;
+  transition: border-color 0.15s, color 0.15s;
+}
+.clear-btn:hover { border-color: var(--text1); color: var(--text0); }
+
+/* ── Messages ── */
+.messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; scroll-behavior: smooth; }
+.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar-track { background: transparent; }
+.messages::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 2px; }
+
+.empty-state {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; color: var(--text2); text-align: center; padding: 40px;
+}
+.empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.4; }
+.empty-state h2 { font-size: 16px; font-weight: 400; color: var(--text1); margin-bottom: 6px; }
+.empty-state p  { font-size: 13px; line-height: 1.6; }
+
+.msg { display: flex; gap: 12px; animation: fadeup 0.3s ease; }
+@keyframes fadeup { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+.msg.user { flex-direction: row-reverse; }
+
+.avatar {
+  width: 30px; height: 30px; border-radius: 6px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 500; font-family: 'IBM Plex Mono', monospace;
+}
+.msg.bot  .avatar { background: var(--green-dim); color: var(--green); border: 1px solid var(--green); }
+.msg.user .avatar { background: var(--bg2); color: var(--text1); border: 1px solid var(--border); }
+
+.bubble-wrap { flex: 1; max-width: calc(100% - 42px); }
+.msg.user .bubble-wrap { display: flex; flex-direction: column; align-items: flex-end; }
+
+.bubble {
+  padding: 12px 16px; border-radius: var(--radius);
+  font-size: 14px; line-height: 1.65; max-width: 100%;
+}
+.msg.bot  .bubble { background: var(--bg1); border: 1px solid var(--border); color: var(--text0); border-top-left-radius: 3px; }
+.msg.user .bubble { background: var(--bg2); border: 1px solid var(--border); color: var(--text0); border-top-right-radius: 3px; }
+
+/* SQL disclosure */
+.sql-toggle {
+  margin-top: 8px; font-size: 11px; color: var(--text2); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px; font-family: 'IBM Plex Mono', monospace;
+  user-select: none;
+}
+.sql-toggle:hover { color: var(--blue); }
+.sql-block {
+  margin-top: 6px; background: var(--bg2); border: 1px solid var(--border);
+  border-left: 3px solid var(--blue); border-radius: 6px;
+  padding: 10px 12px; font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px; color: var(--blue); white-space: pre-wrap;
+  display: none; word-break: break-all;
+}
+.sql-block.open { display: block; }
+.retry-note { font-size: 11px; color: var(--orange); margin-top: 4px; font-family: 'IBM Plex Mono', monospace; }
+
+/* Chart */
+.chart-wrap { margin-top: 10px; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--border); }
+.chart-wrap img { width: 100%; display: block; }
+
+/* Table */
+.table-toggle {
+  margin-top: 8px; font-size: 11px; color: var(--text2); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px; font-family: 'IBM Plex Mono', monospace;
+}
+.table-toggle:hover { color: var(--text0); }
+.table-wrap { margin-top: 6px; overflow-x: auto; border-radius: 6px; border: 1px solid var(--border); display: none; }
+.table-wrap.open { display: block; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 12px; font-family: 'IBM Plex Mono', monospace; }
+.data-table th { background: var(--bg2); color: var(--text1); padding: 7px 12px; text-align: left; border-bottom: 1px solid var(--border); font-weight: 500; white-space: nowrap; }
+.data-table td { padding: 6px 12px; color: var(--text0); border-bottom: 1px solid var(--bg3); white-space: nowrap; }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:hover td { background: var(--bg2); }
+.table-footer { padding: 6px 12px; font-size: 11px; color: var(--text2); font-family: 'IBM Plex Mono', monospace; background: var(--bg2); border-top: 1px solid var(--border); }
+
+/* Error bubble */
+.error-bubble { color: var(--red); }
+
+/* Typing indicator */
+.typing-dots { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+.typing-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--text2); animation: blink 1.2s infinite; }
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink { 0%,80%,100%{opacity:0.2} 40%{opacity:1} }
+
+/* ── Input bar ── */
+.inputbar {
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--bg1);
+  display: flex; gap: 10px; align-items: flex-end;
+}
+.input-wrap { flex: 1; position: relative; }
+textarea {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 11px 14px; resize: none;
+  font-family: 'DM Sans', sans-serif; font-size: 14px; color: var(--text0);
+  line-height: 1.5; outline: none; min-height: 44px; max-height: 140px;
+  transition: border-color 0.15s;
+  scrollbar-width: none;
+}
+textarea:focus { border-color: var(--green); }
+textarea::placeholder { color: var(--text2); }
+.send-btn {
+  width: 44px; height: 44px; border-radius: var(--radius);
+  background: var(--green); border: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; transition: opacity 0.2s, transform 0.1s;
+}
+.send-btn:hover { opacity: 0.85; }
+.send-btn:active { transform: scale(0.95); }
+.send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.send-btn svg { width: 18px; height: 18px; fill: #0d1117; }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-badge">NCT Model</div>
+      <h1>Travel Demand<br>Model Assistant</h1>
+      <p>Demographics · Mode choice · Performance</p>
+    </div>
+
+    <div class="scenario-panel">
+      <span class="upload-label">Model run scenario</span>
+      <select class="perf-select" id="perf-folder-select" onchange="onFolderChanged()">
+        <option value="">— select model run —</option>
+      </select>
+      <button class="load-btn" id="perf-load-btn" onclick="loadScenario()" disabled>Load scenario</button>
+      <div class="perf-status" id="perf-status"></div>
+      <div class="badge-row" id="badge-row"></div>
+    </div>
+
+    <div class="suggestions">
+      <span class="suggestions-label">Quick questions</span>
+      <!-- Demographics -->
+      <button class="chip" onclick="ask('What is the population and employment by county?')">Population &amp; employment by county</button>
+      <button class="chip" onclick="ask('Which cities have the highest employment density?')">Top cities by employment density</button>
+      <!-- Mode choice -->
+      <button class="chip" onclick="ask('What is the transit mode share for HBW trips by county?')">Transit share for HBW trips by county</button>
+      <button class="chip" onclick="ask('Compare total person trips by mode for Inside vs Outside MPA12')">Person trips by mode: Inside vs Outside MPA</button>
+      <!-- Performance measures -->
+      <button class="chip" onclick="ask('What are the lane miles by functional class for each county?')">Lane miles by functional class, all counties</button>
+      <button class="chip" onclick="ask('Compare VMT by functional class across all counties')">VMT by functional class, all counties</button>
+      <button class="chip" onclick="ask('What percent of freeway lane miles are LOS F in Dallas County?')">% freeway LOS F in Dallas County</button>
+      <button class="chip" onclick="ask('Show average loaded speed AM vs PM by county')">Avg loaded speed AM vs PM by county</button>
+    </div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <main class="main">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="topbar-status" id="status-text">No scenario loaded</span>
+      </div>
+      <button class="clear-btn" onclick="clearChat()">Clear chat</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">🛣</div>
+        <h2>Select a model run to begin</h2>
+        <p>Choose a scenario from the sidebar, then ask anything<br>about demographics, mode choice, or roadway performance.</p>
+      </div>
+    </div>
+
+    <div class="inputbar">
+      <div class="input-wrap">
+        <textarea id="userinput" rows="1" placeholder="Ask about demographics, mode choice, or roadway performance..."
+          onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+      </div>
+      <button class="send-btn" id="send-btn" onclick="send()" disabled>
+        <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2z"/></svg>
+      </button>
+    </div>
+  </main>
+
+</div>
+
+<script>
+const API = "http://localhost:5050";
+let scenarioLoaded = false;
+
+// ── Table badges (shown after load) ──────────────────────────────────────────
+const TABLE_LABELS = {
+  county_demographics:  "County Demog",
+  county_modechoice:    "County Mode",
+  county_perfmeasures:  "County Perf",
+  city_demographics:    "City Demog",
+  city_modechoice:      "City Mode",
+  city_perfmeasures:    "City Perf",
+  mpa_demographics:     "MPA Demog",
+  mpa_modechoice:       "MPA Mode",
+  mpa_perfmeasures:     "MPA Perf",
+};
+
+function renderBadges(tables) {
+  const row = document.getElementById("badge-row");
+  row.innerHTML = Object.entries(TABLE_LABELS).map(([key, label]) => {
+    const active = tables.includes(key) ? " active" : "";
+    return `<span class="badge${active}">${label}</span>`;
+  }).join("");
+}
+
+// ── Folder picker ─────────────────────────────────────────────────────────────
+async function initFolders() {
+  try {
+    const res  = await fetch(`${API}/list_model_runs`);
+    const data = await res.json();
+    if (data.error || !data.folders) return;
+    const sel = document.getElementById("perf-folder-select");
+    data.folders.forEach(f => {
+      const opt = document.createElement("option");
+      opt.value = opt.textContent = f;
+      sel.appendChild(opt);
+    });
+  } catch(e) {
+    // server not yet running — silently ignore on page load
+  }
+}
+
+function onFolderChanged() {
+  const val = document.getElementById("perf-folder-select").value;
+  document.getElementById("perf-load-btn").disabled = !val;
+  document.getElementById("perf-status").textContent = "";
+  document.getElementById("perf-status").className = "perf-status";
+  document.getElementById("badge-row").innerHTML = "";
+}
+
+async function loadScenario() {
+  const folder = document.getElementById("perf-folder-select").value;
+  if (!folder) return;
+
+  const statusEl = document.getElementById("perf-status");
+  statusEl.textContent = "Loading…";
+  statusEl.className = "perf-status";
+  document.getElementById("perf-load-btn").disabled = true;
+  document.getElementById("badge-row").innerHTML = "";
+
+  try {
+    const res  = await fetch(`${API}/load_scenario`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ folder }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      statusEl.textContent = "Error: " + data.error;
+      statusEl.className = "perf-status err";
+      document.getElementById("perf-load-btn").disabled = false;
+      return;
+    }
+
+    scenarioLoaded = true;
+    const tableCount = data.tables.length;
+    statusEl.textContent =
+      `${data.total_rows.toLocaleString()} rows · ${tableCount} tables · ` +
+      `${data.counties.length} counties · ${data.cities_count} cities`;
+    statusEl.className = "perf-status ok";
+
+    renderBadges(data.tables);
+
+    document.getElementById("send-btn").disabled = false;
+    document.getElementById("status-text").textContent =
+      `${folder} · ${tableCount} tables loaded`;
+    document.getElementById("status-text").className = "topbar-status ready";
+
+    clearEmpty();
+
+    const sectionSample = data.sections.slice(0, 5).join(", ") +
+      (data.sections.length > 5 ? "…" : "");
+
+    addBotMsg(
+      `Scenario **${folder}** loaded.\n\n` +
+      `**${data.counties.length} counties**, **${data.cities_count} cities**, MPA12 zones.\n` +
+      `Tables loaded: ${data.tables.join(", ")}.\n\n` +
+      `Performance metrics include: ${sectionSample}.\n\n` +
+      `Try asking: *"What is the transit mode share for HBW trips by county?"*`,
+      null, null, null
+    );
+  } catch(e) {
+    statusEl.textContent = "Server error: " + e;
+    statusEl.className = "perf-status err";
+    document.getElementById("perf-load-btn").disabled = false;
+  }
+}
+
+initFolders();
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+function ask(q) {
+  if (!scenarioLoaded) { alert("Load a scenario first."); return; }
+  document.getElementById("userinput").value = q;
+  send();
+}
+
+async function send() {
+  const inp = document.getElementById("userinput");
+  const q = inp.value.trim();
+  if (!q || !scenarioLoaded) return;
+  inp.value = "";
+  autoResize(inp);
+  clearEmpty();
+
+  addUserMsg(q);
+  const typingId = addTyping();
+
+  try {
+    const res = await fetch(`${API}/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q }),
+    });
+    const data = await res.json();
+    removeTyping(typingId);
+
+    if (data.error) {
+      addBotMsg(data.error, data.sql || null, null, null, true);
+    } else {
+      addBotMsg(data.answer, data.sql, data.attempts, data.chart, false,
+                data.rows, data.cols, data.total_rows);
+    }
+  } catch(e) {
+    removeTyping(typingId);
+    addBotMsg("Server error. Is server.py running? " + e, null, null, null, true);
+  }
+}
+
+// ── Message builders ──────────────────────────────────────────────────────────
+let msgId = 0;
+
+function addUserMsg(text) {
+  const msgs = document.getElementById("messages");
+  const id = ++msgId;
+  msgs.innerHTML += `
+  <div class="msg user" id="msg-${id}">
+    <div class="avatar">YOU</div>
+    <div class="bubble-wrap">
+      <div class="bubble">${esc(text)}</div>
+    </div>
+  </div>`;
+  scrollBottom();
+}
+
+function addBotMsg(text, sql, attempts, chart, isError=false, rows=null, cols=null, totalRows=0) {
+  const msgs = document.getElementById("messages");
+  const id = ++msgId;
+  const sqlHtml = sql ? `
+    <div class="sql-toggle" onclick="toggleEl('sql-${id}', this)">▶ SQL query</div>
+    <div class="sql-block" id="sql-${id}">${esc(sql)}</div>
+    ${attempts > 1 ? `<div class="retry-note">⟳ succeeded after ${attempts} attempts</div>` : ""}
+  ` : "";
+
+  const chartHtml = chart
+    ? `<div class="chart-wrap"><img src="data:image/png;base64,${chart}" alt="chart"></div>`
+    : "";
+
+  let tableHtml = "";
+  if (rows && rows.length > 0) {
+    const headers = cols.map(c => `<th>${esc(c)}</th>`).join("");
+    const bodyRows = rows.map(r =>
+      `<tr>${cols.map(c => `<td>${r[c] !== null && r[c] !== undefined ? fmt2(r[c]) : "—"}</td>`).join("")}</tr>`
+    ).join("");
+    tableHtml = `
+      <div class="table-toggle" onclick="toggleEl('tbl-${id}', this)">▶ Raw data (${totalRows} rows)</div>
+      <div class="table-wrap" id="tbl-${id}">
+        <table class="data-table"><thead><tr>${headers}</tr></thead><tbody>${bodyRows}</tbody></table>
+        ${totalRows > 50 ? `<div class="table-footer">Showing first 50 of ${totalRows} rows</div>` : ""}
+      </div>`;
+  }
+
+  msgs.innerHTML += `
+  <div class="msg bot" id="msg-${id}">
+    <div class="avatar">NCT</div>
+    <div class="bubble-wrap">
+      <div class="bubble ${isError ? 'error-bubble' : ''}">${mdToHtml(text)}</div>
+      ${sqlHtml}
+      ${chartHtml}
+      ${tableHtml}
+    </div>
+  </div>`;
+  scrollBottom();
+}
+
+function addTyping() {
+  const id = ++msgId;
+  document.getElementById("messages").innerHTML += `
+  <div class="msg bot" id="msg-${id}">
+    <div class="avatar">NCT</div>
+    <div class="bubble-wrap">
+      <div class="bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>
+    </div>
+  </div>`;
+  scrollBottom();
+  return id;
+}
+
+function removeTyping(id) {
+  const el = document.getElementById(`msg-${id}`);
+  if (el) el.remove();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function clearEmpty() {
+  const e = document.getElementById("empty-state");
+  if (e) e.remove();
+}
+
+function clearChat() {
+  document.getElementById("messages").innerHTML = scenarioLoaded
+    ? ""
+    : `<div class="empty-state" id="empty-state">
+         <div class="empty-icon">🛣</div>
+         <h2>Select a model run to begin</h2>
+         <p>Choose a scenario from the sidebar, then ask anything<br>about demographics, mode choice, or roadway performance.</p>
+       </div>`;
+}
+
+function toggleEl(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle("open");
+  btn.textContent = btn.textContent.replace(/^[▶▼]/, el.classList.contains("open") ? "▼" : "▶");
+}
+
+function scrollBottom() {
+  const m = document.getElementById("messages");
+  setTimeout(() => m.scrollTop = m.scrollHeight, 30);
+}
+
+function handleKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+}
+
+function autoResize(el) {
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 140) + "px";
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function mdToHtml(s) {
+  return esc(s)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/\n/g, "<br>");
+}
+
+function fmt2(v) {
+  if (typeof v === "number") {
+    return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
+  }
+  return esc(String(v));
+}
+</script>
+</body>
+</html>
