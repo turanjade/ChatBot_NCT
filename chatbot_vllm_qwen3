@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NCT Travel Demand Assistant — Compare</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<!-- Served by the Flask app from the installed plotly package (matches the server's figures) -->
+<script src="/plotly.min.js"></script>
+<style>
+:root {
+  --bg0: #0d1117;
+  --bg1: #161b22;
+  --bg2: #21262d;
+  --bg3: #30363d;
+  --text0: #e6edf3;
+  --text1: #8b949e;
+  --text2: #6e7681;
+  --green: #39d353;
+  --green-dim: #196127;
+  --blue: #58a6ff;
+  --orange: #f0883e;
+  --red: #f85149;
+  --purple: #bc8cff;
+  --border: #30363d;
+  --radius: 10px;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: var(--bg0); color: var(--text0); font-family: 'DM Sans', sans-serif; }
+
+/* ── Layout ── */
+.shell { display: grid; grid-template-columns: 300px 1fr; height: 100vh; overflow: hidden; }
+
+/* ── Sidebar ── */
+.sidebar {
+  background: var(--bg1);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.logo {
+  padding: 20px 20px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.logo-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--green-dim); border: 1px solid var(--green);
+  color: var(--green); font-size: 10px; font-family: 'IBM Plex Mono', monospace;
+  padding: 3px 8px; border-radius: 20px; margin-bottom: 8px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+}
+.logo-badge::before { content:''; width:6px; height:6px; border-radius:50%; background:var(--green); animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+.logo h1 { font-size: 14px; font-weight: 500; color: var(--text0); line-height: 1.3; }
+.logo p  { font-size: 11px; color: var(--text1); margin-top: 2px; }
+
+/* ── Scenario slots ── */
+.scenario-slots { overflow-y: auto; flex-shrink: 0; }
+.slot-panel {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.slot-header {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+}
+.slot-tag {
+  font-size: 10px; font-family: 'IBM Plex Mono', monospace;
+  font-weight: 500; padding: 2px 8px; border-radius: 20px;
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+.slot-tag.a { background: rgba(57,211,83,0.15); border: 1px solid var(--green); color: var(--green); }
+.slot-tag.b { background: rgba(188,140,255,0.12); border: 1px solid var(--purple); color: var(--purple); }
+.slot-label { font-size: 11px; color: var(--text2); font-family: 'IBM Plex Mono', monospace; }
+
+.perf-select {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 7px 10px; color: var(--text0);
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+  outline: none; cursor: pointer; margin-bottom: 7px;
+  appearance: none; -webkit-appearance: none;
+}
+.perf-select:focus { border-color: var(--green); }
+.perf-select.slot-b:focus { border-color: var(--purple); }
+.perf-select option { background: var(--bg2); color: var(--text0); }
+
+.load-btn {
+  width: 100%; padding: 8px; border-radius: var(--radius);
+  font-family: 'DM Sans', sans-serif; font-size: 12px; font-weight: 500;
+  border: none; cursor: pointer; transition: opacity 0.2s, transform 0.1s;
+}
+.load-btn.a { background: var(--green); color: #0d1117; }
+.load-btn.b { background: var(--purple); color: #0d1117; }
+.load-btn:hover { opacity: 0.88; }
+.load-btn:active { transform: scale(0.98); }
+.load-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.slot-status { font-size: 10px; font-family: 'IBM Plex Mono', monospace; color: var(--text2); margin-top: 5px; min-height: 14px; line-height: 1.5; }
+.slot-status.ok  { color: var(--green); }
+.slot-status.ok.b { color: var(--purple); }
+.slot-status.err { color: var(--red); }
+
+.badge-row { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
+.badge {
+  font-size: 9px; font-family: 'IBM Plex Mono', monospace;
+  padding: 1px 6px; border-radius: 20px;
+  border: 1px solid var(--border); color: var(--text2); background: var(--bg2);
+}
+.badge.active-a { border-color: var(--green); color: var(--green); background: var(--green-dim); }
+.badge.active-b { border-color: var(--purple); color: var(--purple); background: rgba(188,140,255,0.1); }
+
+/* ── Suggestions ── */
+.suggestions { padding: 14px 16px; flex: 1; overflow-y: auto; }
+.suggestions-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text2); font-family: 'IBM Plex Mono', monospace; margin-bottom: 8px; display: block; }
+.chip {
+  display: block; width: 100%; text-align: left;
+  background: var(--bg2); border: 1px solid var(--border);
+  color: var(--text1); font-size: 11px; padding: 7px 10px;
+  border-radius: 6px; cursor: pointer; margin-bottom: 4px;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+  font-family: 'DM Sans', sans-serif;
+}
+.chip:hover { border-color: var(--green); color: var(--green); background: rgba(57,211,83,0.06); }
+.chip.compare-chip:hover { border-color: var(--purple); color: var(--purple); background: rgba(188,140,255,0.06); }
+.chips-section-label { font-size: 9px; color: var(--text2); font-family: 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: 0.06em; margin: 10px 0 4px; }
+
+/* ── Main chat ── */
+.main { display: flex; flex-direction: column; overflow: hidden; }
+.topbar {
+  padding: 14px 24px;
+  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between;
+  background: var(--bg1);
+}
+.topbar-left { display: flex; align-items: center; gap: 10px; }
+.topbar-status { font-size: 11px; color: var(--text1); font-family: 'IBM Plex Mono', monospace; }
+.topbar-status.ready-a { color: var(--green); }
+.topbar-status.ready-ab { color: var(--purple); }
+.clear-btn {
+  font-size: 11px; color: var(--text1); background: none; border: 1px solid var(--border);
+  padding: 4px 10px; border-radius: 6px; cursor: pointer; font-family: 'DM Sans', sans-serif;
+  transition: border-color 0.15s, color 0.15s;
+}
+.clear-btn:hover { border-color: var(--text1); color: var(--text0); }
+
+/* ── Messages ── */
+.messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 20px; scroll-behavior: smooth; }
+.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar-track { background: transparent; }
+.messages::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 2px; }
+
+.empty-state {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+  justify-content: center; color: var(--text2); text-align: center; padding: 40px;
+}
+.empty-icon { font-size: 40px; margin-bottom: 12px; opacity: 0.4; }
+.empty-state h2 { font-size: 16px; font-weight: 400; color: var(--text1); margin-bottom: 6px; }
+.empty-state p  { font-size: 13px; line-height: 1.6; }
+
+.msg { display: flex; gap: 12px; animation: fadeup 0.3s ease; }
+@keyframes fadeup { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+.msg.user { flex-direction: row-reverse; }
+
+.avatar {
+  width: 30px; height: 30px; border-radius: 6px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 500; font-family: 'IBM Plex Mono', monospace;
+}
+.msg.bot  .avatar { background: var(--green-dim); color: var(--green); border: 1px solid var(--green); }
+.msg.bot.compare .avatar { background: rgba(188,140,255,0.1); color: var(--purple); border: 1px solid var(--purple); }
+.msg.user .avatar { background: var(--bg2); color: var(--text1); border: 1px solid var(--border); }
+
+.bubble-wrap { flex: 1; max-width: calc(100% - 42px); }
+.msg.user .bubble-wrap { display: flex; flex-direction: column; align-items: flex-end; }
+
+.bubble {
+  padding: 12px 16px; border-radius: var(--radius);
+  font-size: 13px; line-height: 1.65; max-width: 100%;
+}
+.msg.bot  .bubble { background: var(--bg1); border: 1px solid var(--border); color: var(--text0); border-top-left-radius: 3px; }
+.msg.bot.compare .bubble { border-color: var(--purple); }
+.msg.user .bubble { background: var(--bg2); border: 1px solid var(--border); color: var(--text0); border-top-right-radius: 3px; }
+
+/* compare badge on bot msg */
+.compare-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; font-family: 'IBM Plex Mono', monospace;
+  color: var(--purple); background: rgba(188,140,255,0.1);
+  border: 1px solid var(--purple); border-radius: 20px;
+  padding: 1px 7px; margin-bottom: 6px;
+}
+
+/* SQL disclosure */
+.sql-toggle {
+  margin-top: 8px; font-size: 11px; color: var(--text2); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px; font-family: 'IBM Plex Mono', monospace;
+  user-select: none;
+}
+.sql-toggle:hover { color: var(--blue); }
+.sql-block {
+  margin-top: 6px; background: var(--bg2); border: 1px solid var(--border);
+  border-left: 3px solid var(--blue); border-radius: 6px;
+  padding: 10px 12px; font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px; color: var(--blue); white-space: pre-wrap;
+  display: none; word-break: break-all;
+}
+.sql-block.open { display: block; }
+.retry-note { font-size: 10px; color: var(--orange); margin-top: 4px; font-family: 'IBM Plex Mono', monospace; }
+
+/* Chart */
+.chart-wrap { margin-top: 10px; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--border); background: var(--bg0); }
+.chart-wrap .plotly-chart { width: 100%; height: 420px; }
+.chart-wrap .chart-error { display: flex; align-items: center; justify-content: center; min-height: 80px; padding: 12px; font-size: 11px; color: var(--text2); font-family: 'IBM Plex Mono', monospace; }
+.chart-dl-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 8px; background: var(--bg2); border-top: 1px solid var(--border); }
+.chart-dl-label { font-size: 10px; color: var(--text2); font-family: 'IBM Plex Mono', monospace; text-transform: uppercase; letter-spacing: 0.06em; margin-right: 2px; }
+.chart-dl-btn { font-size: 11px; padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border); background: var(--bg3); color: var(--text1); cursor: pointer; font-family: 'IBM Plex Mono', monospace; transition: border-color 0.15s, color 0.15s; }
+.chart-dl-btn:hover { border-color: var(--text1); color: var(--text0); }
+.chart-dl-btn:disabled { opacity: 0.5; cursor: progress; }
+
+/* Table */
+.table-toggle {
+  margin-top: 8px; font-size: 11px; color: var(--text2); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px; font-family: 'IBM Plex Mono', monospace;
+}
+.table-toggle:hover { color: var(--text0); }
+.table-wrap { margin-top: 6px; overflow-x: auto; border-radius: 6px; border: 1px solid var(--border); display: none; }
+.table-wrap.open { display: block; }
+.data-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: 'IBM Plex Mono', monospace; }
+.data-table th { background: var(--bg2); color: var(--text1); padding: 6px 12px; text-align: left; border-bottom: 1px solid var(--border); font-weight: 500; white-space: nowrap; }
+.data-table td { padding: 5px 12px; color: var(--text0); border-bottom: 1px solid var(--bg3); white-space: nowrap; }
+.data-table tr:last-child td { border-bottom: none; }
+.data-table tr:hover td { background: var(--bg2); }
+.table-footer { padding: 5px 12px; font-size: 10px; color: var(--text2); font-family: 'IBM Plex Mono', monospace; background: var(--bg2); border-top: 1px solid var(--border); }
+
+.error-bubble { color: var(--red); }
+
+.typing-dots { display: flex; gap: 4px; align-items: center; padding: 4px 0; }
+.typing-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--text2); animation: blink 1.2s infinite; }
+.typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+@keyframes blink { 0%,80%,100%{opacity:0.2} 40%{opacity:1} }
+
+/* ── Input bar ── */
+.inputbar {
+  padding: 14px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--bg1);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.inputbar-row { display: flex; gap: 10px; align-items: flex-end; }
+.input-wrap { flex: 1; position: relative; }
+textarea {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 11px 14px; resize: none;
+  font-family: 'DM Sans', sans-serif; font-size: 13px; color: var(--text0);
+  line-height: 1.5; outline: none; min-height: 44px; max-height: 140px;
+  transition: border-color 0.15s;
+  scrollbar-width: none;
+}
+textarea:focus { border-color: var(--green); }
+textarea::placeholder { color: var(--text2); }
+
+.compare-toggle-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11px; color: var(--text1); font-family: 'IBM Plex Mono', monospace;
+  user-select: none; cursor: pointer;
+}
+.compare-toggle-row input[type=checkbox] { accent-color: var(--purple); width: 14px; height: 14px; cursor: pointer; }
+.compare-toggle-row.disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+.compare-hint { font-size: 10px; color: var(--text2); }
+
+.slot-selector-row {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--text1); font-family: 'IBM Plex Mono', monospace;
+  margin-bottom: 4px;
+}
+.slot-selector-row.hidden { display: none; }
+.slot-btn {
+  padding: 2px 10px; border-radius: 12px; border: 1px solid var(--border);
+  background: transparent; cursor: pointer; font-size: 11px;
+  font-family: 'IBM Plex Mono', monospace; color: var(--text1);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.slot-btn.active-a { border-color: var(--green); background: rgba(57,211,83,0.12); color: var(--green); }
+.slot-btn.active-b { border-color: var(--purple); background: rgba(188,140,255,0.12); color: var(--purple); }
+.slot-btn:hover:not(.active-a):not(.active-b) { border-color: var(--text1); }
+
+.send-btn {
+  width: 44px; height: 44px; border-radius: var(--radius);
+  background: var(--green); border: none; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; transition: opacity 0.2s, transform 0.1s, background 0.2s;
+}
+.send-btn.compare-mode { background: var(--purple); }
+.send-btn:hover { opacity: 0.85; }
+.send-btn:active { transform: scale(0.95); }
+.send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.send-btn svg { width: 18px; height: 18px; fill: #0d1117; }
+</style>
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- ── Sidebar ── -->
+  <aside class="sidebar">
+    <div class="logo">
+      <div class="logo-badge">NCT Model</div>
+      <h1>Travel Demand Model<br>Scenario Compare</h1>
+      <p>Load two scenarios and compare side-by-side</p>
+    </div>
+
+    <div class="scenario-slots">
+
+      <!-- Slot A -->
+      <div class="slot-panel">
+        <div class="slot-header">
+          <span class="slot-tag a">A</span>
+          <span class="slot-label">Base / Reference scenario</span>
+        </div>
+        <select class="perf-select" id="folder-a" onchange="onFolderChanged('a')">
+          <option value="">— select model run —</option>
+        </select>
+        <button class="load-btn a" id="load-btn-a" onclick="loadSlot('A')" disabled>Load Scenario A</button>
+        <div class="slot-status" id="status-a"></div>
+        <div class="badge-row" id="badges-a"></div>
+      </div>
+
+      <!-- Slot B -->
+      <div class="slot-panel">
+        <div class="slot-header">
+          <span class="slot-tag b">B</span>
+          <span class="slot-label">Alternative / Build scenario</span>
+        </div>
+        <select class="perf-select slot-b" id="folder-b" onchange="onFolderChanged('b')">
+          <option value="">— select model run —</option>
+        </select>
+        <button class="load-btn b" id="load-btn-b" onclick="loadSlot('B')" disabled>Load Scenario B</button>
+        <div class="slot-status" id="status-b"></div>
+        <div class="badge-row" id="badges-b"></div>
+      </div>
+
+    </div>
+
+    <div class="suggestions">
+      <span class="suggestions-label">Quick questions</span>
+
+      <div class="chips-section-label">Single scenario (A or B)</div>
+      <button class="chip" onclick="ask('What is the population and employment by county?')">Population &amp; employment by county</button>
+      <button class="chip" onclick="ask('Which cities have the highest employment density?')">Top cities by employment density</button>
+      <button class="chip" onclick="ask('What is the transit mode share for HBW trips by county?')">Transit share for HBW trips by county</button>
+      <button class="chip" onclick="ask('What are the lane miles by functional class for each county?')">Lane miles by functional class</button>
+
+      <div class="chips-section-label">Scenario comparison (A vs B)</div>
+      <button class="chip compare-chip" onclick="askCompare('Compare total employment by county between scenario A and B, and show the difference')">Employment change by county (A vs B)</button>
+      <button class="chip compare-chip" onclick="askCompare('Compare total person trips by mode between scenario A and B for all counties')">Person trips by mode: A vs B</button>
+      <button class="chip compare-chip" onclick="askCompare('Compare daily VMT by functional class between scenario A and B and show percent change')">VMT change by functional class (A vs B)</button>
+      <button class="chip compare-chip" onclick="askCompare('Compare transit mode share for HBW trips by county between scenario A and B')">Transit mode share change (A vs B)</button>
+    </div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <main class="main">
+    <div class="topbar">
+      <div class="topbar-left">
+        <span class="topbar-status" id="status-text">No scenario loaded</span>
+      </div>
+      <button class="clear-btn" onclick="clearChat()">Clear chat</button>
+    </div>
+
+    <div class="messages" id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">⚖️</div>
+        <h2>Load scenarios to begin</h2>
+        <p>Load Scenario A (and optionally B) from the sidebar.<br>
+           Enable <strong>Compare A vs B</strong> to ask cross-scenario questions.</p>
+      </div>
+    </div>
+
+    <div class="inputbar">
+      <div class="slot-selector-row hidden" id="slot-selector-row">
+        <span>Query:</span>
+        <button class="slot-btn active-a" id="slot-btn-a" onclick="selectSlot('A')">A — Base</button>
+        <button class="slot-btn" id="slot-btn-b" onclick="selectSlot('B')">B — Alternative</button>
+      </div>
+      <div class="compare-toggle-row disabled" id="compare-toggle-row">
+        <input type="checkbox" id="compare-chk" onchange="onCompareToggle()">
+        <label for="compare-chk" style="cursor:pointer">Compare A vs B</label>
+        <span class="compare-hint" id="compare-hint">— load both scenarios to enable</span>
+      </div>
+      <div class="inputbar-row">
+        <div class="input-wrap">
+          <textarea id="userinput" rows="1" placeholder="Ask about demographics, mode choice, or roadway performance…"
+            onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
+        </div>
+        <button class="send-btn" id="send-btn" onclick="send()" disabled>
+          <svg viewBox="0 0 24 24"><path d="M2 21L23 12 2 3v7l15 2-15 2z"/></svg>
+        </button>
+      </div>
+    </div>
+  </main>
+
+</div>
+
+<script>
+const API = window.location.origin;
+let loadedA = false, loadedB = false;
+const loadedFolders = { A: "", B: "" };  // model run loaded in each slot (noted on chart downloads)
+let activeSlot = "A"; // which single scenario to query when not in compare mode
+
+const TABLE_LABELS = {
+  county_demographics: "Cty Demog", county_modechoice: "Cty Mode", county_perfmeasures: "Cty Perf",
+  city_demographics:   "City Demog", city_modechoice:   "City Mode", city_perfmeasures:   "City Perf",
+  mpa_demographics:    "MPA Demog", mpa_modechoice:    "MPA Mode",  mpa_perfmeasures:    "MPA Perf",
+};
+
+function renderBadges(tables, slot) {
+  const suffix = slot.toLowerCase();
+  const row = document.getElementById(`badges-${suffix}`);
+  row.innerHTML = Object.entries(TABLE_LABELS).map(([key, label]) => {
+    const active = tables.includes(key) ? ` active-${suffix}` : "";
+    return `<span class="badge${active}">${label}</span>`;
+  }).join("");
+}
+
+// ── Folder picker ─────────────────────────────────────────────────────────────
+async function initFolders() {
+  try {
+    const res  = await fetch(`${API}/list_model_runs`);
+    const data = await res.json();
+    if (data.error || !data.folders) return;
+    ["folder-a", "folder-b"].forEach(id => {
+      const sel = document.getElementById(id);
+      data.folders.forEach(f => {
+        const opt = document.createElement("option");
+        opt.value = opt.textContent = f;
+        sel.appendChild(opt);
+      });
+    });
+  } catch(e) { /* server not yet running */ }
+}
+
+function onFolderChanged(slot) {
+  const val = document.getElementById(`folder-${slot}`).value;
+  document.getElementById(`load-btn-${slot}`).disabled = !val;
+  document.getElementById(`status-${slot}`).textContent = "";
+  document.getElementById(`status-${slot}`).className = "slot-status";
+  document.getElementById(`badges-${slot}`).innerHTML = "";
+}
+
+async function loadSlot(slot) {
+  const folder = document.getElementById(`folder-${slot.toLowerCase()}`).value;
+  if (!folder) return;
+
+  const statusEl = document.getElementById(`status-${slot.toLowerCase()}`);
+  statusEl.textContent = "Loading…";
+  statusEl.className = "slot-status";
+  document.getElementById(`load-btn-${slot.toLowerCase()}`).disabled = true;
+  document.getElementById(`badges-${slot.toLowerCase()}`).innerHTML = "";
+
+  try {
+    const res  = await fetch(`${API}/load_scenario_slot`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ slot, folder }),
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      statusEl.textContent = "Error: " + data.error;
+      statusEl.className = "slot-status err";
+      document.getElementById(`load-btn-${slot.toLowerCase()}`).disabled = false;
+      return;
+    }
+
+    if (slot === "A") loadedA = true;
+    if (slot === "B") loadedB = true;
+    loadedFolders[slot] = folder;
+
+    statusEl.textContent =
+      `${data.total_rows.toLocaleString()} rows · ${data.tables.length} tables · ` +
+      `${data.counties.length} counties`;
+    statusEl.className = `slot-status ok${slot === "B" ? " b" : ""}`;
+
+    renderBadges(data.tables, slot);
+    updateUI(folder, data);
+
+    const sectionSample = data.sections.slice(0, 4).join(", ") + (data.sections.length > 4 ? "…" : "");
+    // Reports this run doesn't have (e.g. older runs without ModeChoice_Summary) can't be queried.
+    const missing = Object.keys(TABLE_LABELS).filter(t => !data.tables.includes(t));
+    clearEmpty();
+    addBotMsg(
+      `**Scenario ${slot}** loaded: *${folder}*\n\n` +
+      `${data.counties.length} counties · ${data.cities_count} cities · MPA12 zones.\n` +
+      `Tables: ${data.tables.join(", ")}.\n` +
+      (missing.length ? `Not in this model run (no report files): ${missing.join(", ")}.\n` : "") +
+      `Performance metrics: ${sectionSample}.` +
+      (loadedA && loadedB ? `\n\n✓ Both scenarios loaded — enable **Compare A vs B** to ask comparison questions.` : ""),
+      null, null, null, false, null, null, 0, false
+    );
+  } catch(e) {
+    statusEl.textContent = "Server error: " + e;
+    statusEl.className = "slot-status err";
+    document.getElementById(`load-btn-${slot.toLowerCase()}`).disabled = false;
+  }
+}
+
+function updateUI(folder, data) {
+  const bothLoaded = loadedA && loadedB;
+  const anyLoaded  = loadedA || loadedB;
+  const statusText = document.getElementById("status-text");
+  if (bothLoaded) {
+    statusText.textContent = "Scenario A & B loaded — compare mode available";
+    statusText.className = "topbar-status ready-ab";
+  } else if (loadedA) {
+    statusText.textContent = `Scenario A: ${document.getElementById("folder-a").value}`;
+    statusText.className = "topbar-status ready-a";
+  } else if (loadedB) {
+    statusText.textContent = `Scenario B: ${document.getElementById("folder-b").value}`;
+    statusText.className = "topbar-status ready-a";
+    activeSlot = "B"; // auto-select B if only B is loaded
+  }
+  document.getElementById("send-btn").disabled = !anyLoaded;
+
+  // Slot selector: show when both are loaded so user can pick which to query alone
+  const slotRow = document.getElementById("slot-selector-row");
+  if (bothLoaded) {
+    slotRow.classList.remove("hidden");
+  } else {
+    slotRow.classList.add("hidden");
+    // auto-set active slot to whichever is loaded
+    if (loadedA) activeSlot = "A";
+    else if (loadedB) activeSlot = "B";
+  }
+
+  const toggleRow = document.getElementById("compare-toggle-row");
+  const hint = document.getElementById("compare-hint");
+  if (bothLoaded) {
+    toggleRow.classList.remove("disabled");
+    hint.textContent = "";
+  } else {
+    toggleRow.classList.add("disabled");
+    hint.textContent = "— load both scenarios to enable";
+    document.getElementById("compare-chk").checked = false;
+    onCompareToggle();
+  }
+}
+
+function selectSlot(slot) {
+  activeSlot = slot;
+  document.getElementById("slot-btn-a").className = "slot-btn" + (slot === "A" ? " active-a" : "");
+  document.getElementById("slot-btn-b").className = "slot-btn" + (slot === "B" ? " active-b" : "");
+}
+
+function onCompareToggle() {
+  const isCompare = document.getElementById("compare-chk").checked;
+  const btn = document.getElementById("send-btn");
+  btn.classList.toggle("compare-mode", isCompare);
+  document.getElementById("userinput").placeholder = isCompare
+    ? "Ask a comparison question across Scenario A and B…"
+    : "Ask about demographics, mode choice, or roadway performance…";
+  // hide slot selector while in compare mode
+  const slotRow = document.getElementById("slot-selector-row");
+  if (loadedA && loadedB) {
+    slotRow.classList.toggle("hidden", isCompare);
+  }
+}
+
+initFolders();
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+function ask(q) {
+  if (!loadedA && !loadedB) { alert("Load a scenario first."); return; }
+  document.getElementById("userinput").value = q;
+  document.getElementById("compare-chk").checked = false;
+  onCompareToggle();
+  send();
+}
+
+function askCompare(q) {
+  if (!loadedA || !loadedB) { alert("Load both Scenario A and B first."); return; }
+  document.getElementById("userinput").value = q;
+  document.getElementById("compare-chk").checked = true;
+  onCompareToggle();
+  send();
+}
+
+async function send() {
+  const inp = document.getElementById("userinput");
+  const q = inp.value.trim();
+  if (!q || (!loadedA && !loadedB)) return;
+  const isCompare = document.getElementById("compare-chk").checked && loadedA && loadedB;
+  inp.value = "";
+  autoResize(inp);
+  clearEmpty();
+
+  addUserMsg(q, isCompare);
+  const typingId = addTyping(isCompare);
+  const chartMeta = { question: q, scenario: scenarioLabel(isCompare) };
+
+  try {
+    const body = { question: q, compare: isCompare };
+    if (!isCompare) body.slot = activeSlot;
+    const res = await fetch(`${API}/ask`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    removeTyping(typingId);
+
+    if (data.error) {
+      addBotMsg(data.error, data.sql || null, null, null, true, null, null, 0, isCompare);
+    } else {
+      addBotMsg(data.answer, data.sql, data.attempts, data.chart, false,
+                data.rows, data.cols, data.total_rows, isCompare, chartMeta);
+    }
+  } catch(e) {
+    removeTyping(typingId);
+    addBotMsg("Server error. Is the server running? " + e, null, null, null, true, null, null, 0, false);
+  }
+}
+
+// ── Message builders ──────────────────────────────────────────────────────────
+let msgId = 0;
+
+function addUserMsg(text, isCompare) {
+  const msgs = document.getElementById("messages");
+  const id = ++msgId;
+  let tag = "";
+  if (isCompare) {
+    tag = `<span style="font-size:10px;color:var(--purple);font-family:'IBM Plex Mono',monospace;margin-right:6px">[A vs B]</span>`;
+  } else if (loadedA && loadedB) {
+    const color = activeSlot === "B" ? "var(--purple)" : "var(--green)";
+    tag = `<span style="font-size:10px;color:${color};font-family:'IBM Plex Mono',monospace;margin-right:6px">[Scenario ${activeSlot}]</span>`;
+  }
+  // insertAdjacentHTML, not innerHTML +=, so earlier charts stay live Plotly plots
+  msgs.insertAdjacentHTML("beforeend", `
+  <div class="msg user" id="msg-${id}">
+    <div class="avatar">YOU</div>
+    <div class="bubble-wrap">
+      <div class="bubble">${tag}${esc(text)}</div>
+    </div>
+  </div>`);
+  scrollBottom();
+}
+
+function addBotMsg(text, sql, attempts, chart, isError=false, rows=null, cols=null, totalRows=0, isCompare=false, meta=null) {
+  const msgs = document.getElementById("messages");
+  const id = ++msgId;
+
+  const compareBadge = isCompare
+    ? `<div class="compare-badge">⚖ Comparing A vs B</div>`
+    : "";
+
+  const sqlHtml = sql ? `
+    <div class="sql-toggle" onclick="toggleEl('sql-${id}', this)">▶ SQL query</div>
+    <div class="sql-block" id="sql-${id}">${esc(sql)}</div>
+    ${attempts > 1 ? `<div class="retry-note">⟳ succeeded after ${attempts} attempts</div>` : ""}
+  ` : "";
+
+  const chartId = `chart-${id}`;
+  const chartHtml = chart ? `
+    <div class="chart-wrap">
+      <div id="${chartId}" class="plotly-chart"></div>
+      <div class="chart-dl-bar">
+        <span class="chart-dl-label">Download</span>
+        <button class="chart-dl-btn" onclick="downloadChartHtml('${chartId}', this)"
+                title="Standalone .html file: keeps hover, zoom and legend toggles, and opens offline in any browser">⬇ Interactive HTML</button>
+        <button class="chart-dl-btn" onclick="downloadChartImage('${chartId}', 'png')">⬇ PNG</button>
+        <button class="chart-dl-btn" onclick="downloadChartImage('${chartId}', 'jpeg')">⬇ JPEG</button>
+      </div>
+    </div>` : "";
+  if (chart) {
+    charts[chartId] = { fig: chart, question: (meta && meta.question) || "",
+                        scenario: (meta && meta.scenario) || "" };
+  }
+
+  let tableHtml = "";
+  if (rows && rows.length > 0) {
+    const headers = cols.map(c => `<th>${esc(c)}</th>`).join("");
+    const bodyRows = rows.map(r =>
+      `<tr>${cols.map(c => `<td>${r[c] !== null && r[c] !== undefined ? fmt2(r[c]) : "—"}</td>`).join("")}</tr>`
+    ).join("");
+    tableHtml = `
+      <div class="table-toggle" onclick="toggleEl('tbl-${id}', this)">▶ Raw data (${totalRows} rows)</div>
+      <div class="table-wrap" id="tbl-${id}">
+        <table class="data-table"><thead><tr>${headers}</tr></thead><tbody>${bodyRows}</tbody></table>
+        ${totalRows > 50 ? `<div class="table-footer">Showing first 50 of ${totalRows} rows</div>` : ""}
+      </div>`;
+  }
+
+  msgs.insertAdjacentHTML("beforeend", `
+  <div class="msg bot${isCompare ? ' compare' : ''}" id="msg-${id}">
+    <div class="avatar">${isCompare ? 'A↔B' : 'NCT'}</div>
+    <div class="bubble-wrap">
+      ${compareBadge}
+      <div class="bubble ${isError ? 'error-bubble' : ''}">${isError ? plainToHtml(text) : mdToHtml(text)}</div>
+      ${sqlHtml}
+      ${chartHtml}
+      ${tableHtml}
+    </div>
+  </div>`);
+  if (chart) renderChart(chartId);
+  scrollBottom();
+}
+
+function addTyping(isCompare) {
+  const id = ++msgId;
+  document.getElementById("messages").insertAdjacentHTML("beforeend", `
+  <div class="msg bot${isCompare ? ' compare' : ''}" id="msg-${id}">
+    <div class="avatar">${isCompare ? 'A↔B' : 'NCT'}</div>
+    <div class="bubble-wrap">
+      <div class="bubble"><div class="typing-dots"><span></span><span></span><span></span></div></div>
+    </div>
+  </div>`);
+  scrollBottom();
+  return id;
+}
+
+function removeTyping(id) {
+  const el = document.getElementById(`msg-${id}`);
+  if (el) el.remove();
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function clearEmpty() {
+  const e = document.getElementById("empty-state");
+  if (e) e.remove();
+}
+
+function clearChat() {
+  Object.keys(charts).forEach(id => {
+    const el = document.getElementById(id);
+    if (el && typeof Plotly !== "undefined") Plotly.purge(el);
+    delete charts[id];
+  });
+  document.getElementById("messages").innerHTML = (loadedA || loadedB)
+    ? ""
+    : `<div class="empty-state" id="empty-state">
+         <div class="empty-icon">⚖️</div>
+         <h2>Load scenarios to begin</h2>
+         <p>Load Scenario A (and optionally B) from the sidebar.</p>
+       </div>`;
+}
+
+function toggleEl(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.classList.toggle("open");
+  btn.textContent = btn.textContent.replace(/^[▶▼]/, el.classList.contains("open") ? "▼" : "▶");
+}
+
+function scrollBottom() {
+  const m = document.getElementById("messages");
+  setTimeout(() => m.scrollTop = m.scrollHeight, 30);
+}
+
+function handleKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+}
+
+function autoResize(el) {
+  el.style.height = "auto";
+  el.style.height = Math.min(el.scrollHeight, 140) + "px";
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+// Error text often quotes SQL, where * is multiplication, not markdown emphasis.
+function plainToHtml(s) {
+  return esc(s).replace(/\n/g, "<br>");
+}
+
+function mdToHtml(s) {
+  return esc(s)
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*(.+?)\*/g, "<em>$1</em>")
+    .replace(/\n/g, "<br>");
+}
+
+function fmt2(v) {
+  if (typeof v === "number") {
+    return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
+  }
+  return esc(String(v));
+}
+
+function scenarioLabel(isCompare) {
+  if (isCompare) return `Scenario A: ${loadedFolders.A} vs Scenario B: ${loadedFolders.B}`;
+  return `Scenario ${activeSlot}: ${loadedFolders[activeSlot]}`;
+}
+
+// ── Charts ────────────────────────────────────────────────────────────────────
+// /ask returns each chart as Plotly JSON ({data, layout}) built by the server.
+const charts = {};         // chart element id -> { fig, question, scenario }
+let plotlySource = null;   // plotly.js text, fetched once and inlined into HTML downloads
+
+function chartConfig(entry) {
+  return {
+    responsive: true,
+    displaylogo: false,
+    modeBarButtonsToRemove: ["select2d", "lasso2d"],
+    toImageButtonOptions: { format: "png", filename: chartFileName(entry), scale: 2 },
+  };
+}
+
+function renderChart(chartId) {
+  const el = document.getElementById(chartId);
+  const entry = charts[chartId];
+  if (!el || !entry) return;
+  if (typeof Plotly === "undefined") {
+    chartFailed(el, "plotly.js did not load from the server (/plotly.min.js). An older copy " +
+                    "of the server may still be running on port 5050; stop it and restart");
+    return;
+  }
+  if (!entry.fig || typeof entry.fig !== "object" || !entry.fig.layout) {
+    chartFailed(el, "the server sent an old-style static chart. An older copy of the server " +
+                    "may still be running on port 5050; stop it and restart");
+    return;
+  }
+  const fig = JSON.parse(JSON.stringify(entry.fig));   // Plotly mutates what it is given
+  el.style.height = (fig.layout.height || 420) + "px";
+  try {
+    Plotly.newPlot(el, fig.data, fig.layout, chartConfig(entry))
+      .then(scrollBottom, err => chartFailed(el, err));
+  } catch (err) {
+    chartFailed(el, err);
+  }
+}
+
+function chartFailed(el, err) {
+  console.error("Chart render failed:", err);
+  el.className = "chart-error";
+  el.style.height = "";
+  const reason = (err && err.message) || String(err || "unknown error");
+  el.textContent = `Could not draw this chart: ${reason}. The values are in the raw data below.`;
+  const bar = el.parentElement && el.parentElement.querySelector(".chart-dl-bar");
+  if (bar) bar.remove();
+}
+
+function chartFileName(entry) {
+  // The question as the file name, minus characters Windows does not allow.
+  const slug = ((entry && entry.question) || "")
+    .replace(/[\s!-\/:-@\[-`{-~]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/, "")
+    .toLowerCase();
+  return "nct-chart" + (slug ? "-" + slug : "");
+}
+
+function downloadChartImage(chartId, format) {
+  const el = document.getElementById(chartId);
+  if (!el || !el.data) return;
+  // Current view (zoom, hidden series) at 2x resolution.
+  Plotly.downloadImage(el, { format, filename: chartFileName(charts[chartId]), scale: 2 })
+    .catch(err => console.error("Image download failed:", err));
+}
+
+async function downloadChartHtml(chartId, btn) {
+  const el = document.getElementById(chartId);
+  const entry = charts[chartId];
+  if (!el || !entry || !el.data) return;
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Preparing…";
+  try {
+    let lib;
+    try {
+      if (plotlySource === null) {
+        const res = await fetch(`${API}/plotly.min.js`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        plotlySource = await res.text();
+      }
+      lib = `<script>${plotlySource}<\/script>`;   // self-contained: opens offline
+    } catch (err) {
+      console.warn("Could not inline plotly.js; the file will load it from the CDN.", err);
+      lib = `<script src="https://cdn.plot.ly/plotly-${Plotly.version}.min.js"><\/script>`;
+    }
+    const html = chartHtmlDocument(el, entry, lib);
+    saveBlob(new Blob([html], { type: "text/html;charset=utf-8" }), chartFileName(entry) + ".html");
+  } catch (err) {
+    console.error("HTML download failed:", err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
+function chartHtmlDocument(gd, entry, libTag) {
+  // The chart as the viewer left it (hidden series, zoom), sized to fill the page.
+  const layout = JSON.parse(JSON.stringify(gd.layout));
+  delete layout.width;
+  delete layout.height;
+  layout.autosize = true;
+  const figure = JSON.stringify({ data: gd.data, layout }).replace(/</g, "\\u003c");
+  const config = JSON.stringify(chartConfig(entry));
+  const title = entry.question || "NCT chart";
+  const meta = [entry.scenario, "Exported " + new Date().toLocaleString()].filter(Boolean).join(" · ");
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
+               font-family: "DM Sans", "Segoe UI", Arial, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 16px 20px 4px; }
+  h1 { margin: 0 0 4px; font-size: 16px; font-weight: 500; line-height: 1.4; }
+  .meta { font-size: 12px; color: #8b949e; }
+  #chart { flex: 1; min-height: 420px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>${esc(title)}</h1>
+  <div class="meta">${esc(meta)}</div>
+</header>
+<div id="chart"></div>
+${libTag}
+<script>
+const figure = ${figure};
+Plotly.newPlot("chart", figure.data, figure.layout, ${config});
+<\/script>
+</body>
+</html>`;
+}
+
+function saveBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+</script>
+</body>
+</html>
