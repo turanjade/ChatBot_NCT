@@ -1,0 +1,2087 @@
+import os
+
+import re, sqlite3, tempfile, threading, functools, socket, sys
+import numpy as np
+import pandas as pd
+import openmatrix as omx
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from plotly.offline import get_plotlyjs, get_plotlyjs_version
+import json
+from urllib import request as urlrequest
+from flask import Flask, request, jsonify, Response
+from concurrent.futures import ThreadPoolExecutor
+import webbrowser
+from threading import Timer
+
+import math as _math
+from flask.json.provider import DefaultJSONProvider as _DefaultJSONProvider
+
+def _sanitize(obj):
+    """Recursively replace NaN/Inf (float and numpy scalar) with None."""
+    if isinstance(obj, float):
+        return None if (_math.isnan(obj) or _math.isinf(obj)) else obj
+    # numpy scalar types (np.float64, np.float32, etc.)
+    if hasattr(obj, "item"):
+        return _sanitize(obj.item())
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+class _SafeJSONProvider(_DefaultJSONProvider):
+    def dumps(self, obj, **kwargs):
+        return super().dumps(_sanitize(obj), **kwargs)
+
+app = Flask(__name__)
+app.json_provider_class = _SafeJSONProvider
+app.json = _SafeJSONProvider(app)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
+
+DB = {
+    "A": {"conn": None, "schema": None, "folder": None},
+    "B": {"conn": None, "schema": None, "folder": None},
+}
+PERF = {"data": None}
+MODEL_RUNS_ROOT = os.environ.get("MODEL_RUNS_ROOT", r"L:\NCTModel\ModelRuns")
+
+DB_LOCK = threading.Lock()
+WRITE_LOCK = threading.Lock()
+
+# SQLite and this web server stay on the workstation. Questions, the schema and the
+# generated SQL go to the configured endpoint; with LLM_SEND_RESULTS=1 the query result
+# (up to 50 rows) goes too, so the model can answer in plain language instead of the
+# table preview. Set an approved HTTPS URL or an authenticated local tunnel.
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "").rstrip("/")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen3-14B")
+LLM_SEND_RESULTS = os.environ.get("LLM_SEND_RESULTS", "0") == "1"
+
+def llm_chat(system_prompt, user_prompt, max_tokens=1024):
+    if not LLM_BASE_URL or not LLM_API_KEY:
+        raise RuntimeError("Set LLM_BASE_URL (ending in /v1) and LLM_API_KEY before asking questions")
+    if not LLM_BASE_URL.endswith("/v1"):
+        raise RuntimeError("LLM_BASE_URL must end in /v1")
+    if not (LLM_BASE_URL.startswith("https://") or
+            LLM_BASE_URL.startswith("http://127.0.0.1:") or
+            LLM_BASE_URL.startswith("http://localhost:")):
+        raise RuntimeError("Use HTTPS for remote LLM_BASE_URL (or an authenticated local tunnel)")
+    payload = {
+        "model": MODEL,
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+        "messages": [{"role": "system", "content": system_prompt},
+                     {"role": "user", "content": user_prompt}],
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    req = urlrequest.Request(
+        f"{LLM_BASE_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {LLM_API_KEY}",
+                 "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlrequest.urlopen(req, timeout=300) as response:
+        reply = json.load(response)
+    content = reply["choices"][0]["message"].get("content")
+    if not content or not content.strip():
+        raise RuntimeError("LLM returned empty content; check thinking settings and token limit")
+    return content.strip()
+
+
+# ── Mode choice field metadata (field name → human description, unit) ─────────
+# Source: ModelRunReports_SummaryFields (ModeChoice_Summary_Fields)
+# The first column in every modechoice table is the geography key (COUNTY/CITY/MPA12).
+# All remaining columns follow the pattern <PURPOSE>_<DIRECTION>_<INTRA>_<MODE>_PTRIPS
+# or <PURPOSE>_<DIRECTION>_<INTRA>_VOCC.
+MODECHOICE_META = {
+    # ── Home-Based Work (HBW) ─────────────────────────────────────────────────
+    "HBW_PRD_NOINTRA_WLKTR_PTRIPS": ("HBW Person Trips Produced (No Intrazonals) - Transit Walk",         "trip"),
+    "HBW_PRD_NOINTRA_DRVTR_PTRIPS": ("HBW Person Trips Produced (No Intrazonals) - Transit Drive",        "trip"),
+    "HBW_PRD_NOINTRA_TR_PTRIPS":    ("HBW Person Trips Produced (No Intrazonals) - Transit Total",        "trip"),
+    "HBW_PRD_NOINTRA_DAAUTO_PTRIPS":("HBW Person Trips Produced (No Intrazonals) - Auto Drive Alone",     "trip"),
+    "HBW_PRD_NOINTRA_SR2AUTO_PTRIPS":("HBW Person Trips Produced (No Intrazonals) - Auto Shared Ride 2",  "trip"),
+    "HBW_PRD_NOINTRA_SR3AUTO_PTRIPS":("HBW Person Trips Produced (No Intrazonals) - Auto Shared Ride 3+", "trip"),
+    "HBW_PRD_NOINTRA_AUTO_PTRIPS":  ("HBW Person Trips Produced (No Intrazonals) - Auto Total",           "trip"),
+    "HBW_PRD_NOINTRA_TOT_PTRIPS":   ("HBW Person Trips Produced (No Intrazonals) - All Modes Total",      "trip"),
+    "HBW_ATT_NOINTRA_WLKTR_PTRIPS": ("HBW Person Trips Attracted (No Intrazonals) - Transit Walk",        "trip"),
+    "HBW_ATT_NOINTRA_DRVTR_PTRIPS": ("HBW Person Trips Attracted (No Intrazonals) - Transit Drive",       "trip"),
+    "HBW_ATT_NOINTRA_TR_PTRIPS":    ("HBW Person Trips Attracted (No Intrazonals) - Transit Total",       "trip"),
+    "HBW_ATT_NOINTRA_DAAUTO_PTRIPS":("HBW Person Trips Attracted (No Intrazonals) - Auto Drive Alone",    "trip"),
+    "HBW_ATT_NOINTRA_SR2AUTO_PTRIPS":("HBW Person Trips Attracted (No Intrazonals) - Auto Shared Ride 2", "trip"),
+    "HBW_ATT_NOINTRA_SR3AUTO_PTRIPS":("HBW Person Trips Attracted (No Intrazonals) - Auto Shared Ride 3+","trip"),
+    "HBW_ATT_NOINTRA_AUTO_PTRIPS":  ("HBW Person Trips Attracted (No Intrazonals) - Auto Total",          "trip"),
+    "HBW_ATT_NOINTRA_TOT_PTRIPS":   ("HBW Person Trips Attracted (No Intrazonals) - All Modes Total",     "trip"),
+    "HBW_INTRA_WLKTR_PTRIPS":       ("HBW Person Trips Intrazonal - Transit Walk",                        "trip"),
+    "HBW_INTRA_DRVTR_PTRIPS":       ("HBW Person Trips Intrazonal - Transit Drive",                       "trip"),
+    "HBW_INTRA_TR_PTRIPS":          ("HBW Person Trips Intrazonal - Transit Total",                       "trip"),
+    "HBW_INTRA_DAAUTO_PTRIPS":      ("HBW Person Trips Intrazonal - Auto Drive Alone",                    "trip"),
+    "HBW_INTRA_SR2AUTO_PTRIPS":     ("HBW Person Trips Intrazonal - Auto Shared Ride 2",                  "trip"),
+    "HBW_INTRA_SR3AUTO_PTRIPS":     ("HBW Person Trips Intrazonal - Auto Shared Ride 3+",                 "trip"),
+    "HBW_INTRA_AUTO_PTRIPS":        ("HBW Person Trips Intrazonal - Auto Total",                          "trip"),
+    "HBW_INTRA_TOT_PTRIPS":         ("HBW Person Trips Intrazonal - All Modes Total",                     "trip"),
+    # ── Home-Based Non-Work (HNW) ─────────────────────────────────────────────
+    "HNW_PRD_NOINTRA_WLKTR_PTRIPS": ("HNW Person Trips Produced (No Intrazonals) - Transit Walk",         "trip"),
+    "HNW_PRD_NOINTRA_DRVTR_PTRIPS": ("HNW Person Trips Produced (No Intrazonals) - Transit Drive",        "trip"),
+    "HNW_PRD_NOINTRA_TR_PTRIPS":    ("HNW Person Trips Produced (No Intrazonals) - Transit Total",        "trip"),
+    "HNW_PRD_NOINTRA_DAAUTO_PTRIPS":("HNW Person Trips Produced (No Intrazonals) - Auto Drive Alone",     "trip"),
+    "HNW_PRD_NOINTRA_SR2AUTO_PTRIPS":("HNW Person Trips Produced (No Intrazonals) - Auto Shared Ride 2",  "trip"),
+    "HNW_PRD_NOINTRA_SR3AUTO_PTRIPS":("HNW Person Trips Produced (No Intrazonals) - Auto Shared Ride 3+", "trip"),
+    "HNW_PRD_NOINTRA_AUTO_PTRIPS":  ("HNW Person Trips Produced (No Intrazonals) - Auto Total",           "trip"),
+    "HNW_PRD_NOINTRA_TOT_PTRIPS":   ("HNW Person Trips Produced (No Intrazonals) - All Modes Total",      "trip"),
+    "HNW_ATT_NOINTRA_WLKTR_PTRIPS": ("HNW Person Trips Attracted (No Intrazonals) - Transit Walk",        "trip"),
+    "HNW_ATT_NOINTRA_DRVTR_PTRIPS": ("HNW Person Trips Attracted (No Intrazonals) - Transit Drive",       "trip"),
+    "HNW_ATT_NOINTRA_TR_PTRIPS":    ("HNW Person Trips Attracted (No Intrazonals) - Transit Total",       "trip"),
+    "HNW_ATT_NOINTRA_DAAUTO_PTRIPS":("HNW Person Trips Attracted (No Intrazonals) - Auto Drive Alone",    "trip"),
+    "HNW_ATT_NOINTRA_SR2AUTO_PTRIPS":("HNW Person Trips Attracted (No Intrazonals) - Auto Shared Ride 2", "trip"),
+    "HNW_ATT_NOINTRA_SR3AUTO_PTRIPS":("HNW Person Trips Attracted (No Intrazonals) - Auto Shared Ride 3+","trip"),
+    "HNW_ATT_NOINTRA_AUTO_PTRIPS":  ("HNW Person Trips Attracted (No Intrazonals) - Auto Total",          "trip"),
+    "HNW_ATT_NOINTRA_TOT_PTRIPS":   ("HNW Person Trips Attracted (No Intrazonals) - All Modes Total",     "trip"),
+    "HNW_INTRA_WLKTR_PTRIPS":       ("HNW Person Trips Intrazonal - Transit Walk",                        "trip"),
+    "HNW_INTRA_DRVTR_PTRIPS":       ("HNW Person Trips Intrazonal - Transit Drive",                       "trip"),
+    "HNW_INTRA_TR_PTRIPS":          ("HNW Person Trips Intrazonal - Transit Total",                       "trip"),
+    "HNW_INTRA_DAAUTO_PTRIPS":      ("HNW Person Trips Intrazonal - Auto Drive Alone",                    "trip"),
+    "HNW_INTRA_SR2AUTO_PTRIPS":     ("HNW Person Trips Intrazonal - Auto Shared Ride 2",                  "trip"),
+    "HNW_INTRA_SR3AUTO_PTRIPS":     ("HNW Person Trips Intrazonal - Auto Shared Ride 3+",                 "trip"),
+    "HNW_INTRA_AUTO_PTRIPS":        ("HNW Person Trips Intrazonal - Auto Total",                          "trip"),
+    "HNW_INTRA_TOT_PTRIPS":         ("HNW Person Trips Intrazonal - All Modes Total",                     "trip"),
+    # ── Non-Home-Based (NHB) ──────────────────────────────────────────────────
+    "NHB_PRD_NOINTRA_WLKTR_PTRIPS": ("NHB Person Trips Produced (No Intrazonals) - Transit Walk",         "trip"),
+    "NHB_PRD_NOINTRA_DRVTR_PTRIPS": ("NHB Person Trips Produced (No Intrazonals) - Transit Drive",        "trip"),
+    "NHB_PRD_NOINTRA_TR_PTRIPS":    ("NHB Person Trips Produced (No Intrazonals) - Transit Total",        "trip"),
+    "NHB_PRD_NOINTRA_DAAUTO_PTRIPS":("NHB Person Trips Produced (No Intrazonals) - Auto Drive Alone",     "trip"),
+    "NHB_PRD_NOINTRA_SR2AUTO_PTRIPS":("NHB Person Trips Produced (No Intrazonals) - Auto Shared Ride 2",  "trip"),
+    "NHB_PRD_NOINTRA_SR3AUTO_PTRIPS":("NHB Person Trips Produced (No Intrazonals) - Auto Shared Ride 3+", "trip"),
+    "NHB_PRD_NOINTRA_AUTO_PTRIPS":  ("NHB Person Trips Produced (No Intrazonals) - Auto Total",           "trip"),
+    "NHB_PRD_NOINTRA_TOT_PTRIPS":   ("NHB Person Trips Produced (No Intrazonals) - All Modes Total",      "trip"),
+    "NHB_ATT_NOINTRA_WLKTR_PTRIPS": ("NHB Person Trips Attracted (No Intrazonals) - Transit Walk",        "trip"),
+    "NHB_ATT_NOINTRA_DRVTR_PTRIPS": ("NHB Person Trips Attracted (No Intrazonals) - Transit Drive",       "trip"),
+    "NHB_ATT_NOINTRA_TR_PTRIPS":    ("NHB Person Trips Attracted (No Intrazonals) - Transit Total",       "trip"),
+    "NHB_ATT_NOINTRA_DAAUTO_PTRIPS":("NHB Person Trips Attracted (No Intrazonals) - Auto Drive Alone",    "trip"),
+    "NHB_ATT_NOINTRA_SR2AUTO_PTRIPS":("NHB Person Trips Attracted (No Intrazonals) - Auto Shared Ride 2", "trip"),
+    "NHB_ATT_NOINTRA_SR3AUTO_PTRIPS":("NHB Person Trips Attracted (No Intrazonals) - Auto Shared Ride 3+","trip"),
+    "NHB_ATT_NOINTRA_AUTO_PTRIPS":  ("NHB Person Trips Attracted (No Intrazonals) - Auto Total",          "trip"),
+    "NHB_ATT_NOINTRA_TOT_PTRIPS":   ("NHB Person Trips Attracted (No Intrazonals) - All Modes Total",     "trip"),
+    "NHB_INTRA_WLKTR_PTRIPS":       ("NHB Person Trips Intrazonal - Transit Walk",                        "trip"),
+    "NHB_INTRA_DRVTR_PTRIPS":       ("NHB Person Trips Intrazonal - Transit Drive",                       "trip"),
+    "NHB_INTRA_TR_PTRIPS":          ("NHB Person Trips Intrazonal - Transit Total",                       "trip"),
+    "NHB_INTRA_DAAUTO_PTRIPS":      ("NHB Person Trips Intrazonal - Auto Drive Alone",                    "trip"),
+    "NHB_INTRA_SR2AUTO_PTRIPS":     ("NHB Person Trips Intrazonal - Auto Shared Ride 2",                  "trip"),
+    "NHB_INTRA_SR3AUTO_PTRIPS":     ("NHB Person Trips Intrazonal - Auto Shared Ride 3+",                 "trip"),
+    "NHB_INTRA_AUTO_PTRIPS":        ("NHB Person Trips Intrazonal - Auto Total",                          "trip"),
+    "NHB_INTRA_TOT_PTRIPS":         ("NHB Person Trips Intrazonal - All Modes Total",                     "trip"),
+    # ── All Purposes (TOTAL) ─────────────────────────────────────────────────
+    "TOTAL_PRD_NOINTRA_WLKTR_PTRIPS": ("All Purposes Person Trips Produced (No Intrazonals) - Transit Walk",         "trip"),
+    "TOTAL_PRD_NOINTRA_DRVTR_PTRIPS": ("All Purposes Person Trips Produced (No Intrazonals) - Transit Drive",        "trip"),
+    "TOTAL_PRD_NOINTRA_TR_PTRIPS":    ("All Purposes Person Trips Produced (No Intrazonals) - Transit Total",        "trip"),
+    "TOTAL_PRD_NOINTRA_DAAUTO_PTRIPS":("All Purposes Person Trips Produced (No Intrazonals) - Auto Drive Alone",     "trip"),
+    "TOTAL_PRD_NOINTRA_SR2AUTO_PTRIPS":("All Purposes Person Trips Produced (No Intrazonals) - Auto Shared Ride 2",  "trip"),
+    "TOTAL_PRD_NOINTRA_SR3AUTO_PTRIPS":("All Purposes Person Trips Produced (No Intrazonals) - Auto Shared Ride 3+", "trip"),
+    "TOTAL_PRD_NOINTRA_AUTO_PTRIPS":  ("All Purposes Person Trips Produced (No Intrazonals) - Auto Total",           "trip"),
+    "TOTAL_PRD_NOINTRA_TOT_PTRIPS":   ("All Purposes Person Trips Produced (No Intrazonals) - All Modes Total",      "trip"),
+    "TOTAL_ATT_NOINTRA_WLKTR_PTRIPS": ("All Purposes Person Trips Attracted (No Intrazonals) - Transit Walk",        "trip"),
+    "TOTAL_ATT_NOINTRA_DRVTR_PTRIPS": ("All Purposes Person Trips Attracted (No Intrazonals) - Transit Drive",       "trip"),
+    "TOTAL_ATT_NOINTRA_TR_PTRIPS":    ("All Purposes Person Trips Attracted (No Intrazonals) - Transit Total",       "trip"),
+    "TOTAL_ATT_NOINTRA_DAAUTO_PTRIPS":("All Purposes Person Trips Attracted (No Intrazonals) - Auto Drive Alone",    "trip"),
+    "TOTAL_ATT_NOINTRA_SR2AUTO_PTRIPS":("All Purposes Person Trips Attracted (No Intrazonals) - Auto Shared Ride 2", "trip"),
+    "TOTAL_ATT_NOINTRA_SR3AUTO_PTRIPS":("All Purposes Person Trips Attracted (No Intrazonals) - Auto Shared Ride 3+","trip"),
+    "TOTAL_ATT_NOINTRA_AUTO_PTRIPS":  ("All Purposes Person Trips Attracted (No Intrazonals) - Auto Total",          "trip"),
+    "TOTAL_ATT_NOINTRA_TOT_PTRIPS":   ("All Purposes Person Trips Attracted (No Intrazonals) - All Modes Total",     "trip"),
+    "TOTAL_INTRA_WLKTR_PTRIPS":       ("All Purposes Person Trips Intrazonal - Transit Walk",                        "trip"),
+    "TOTAL_INTRA_DRVTR_PTRIPS":       ("All Purposes Person Trips Intrazonal - Transit Drive",                       "trip"),
+    "TOTAL_INTRA_TR_PTRIPS":          ("All Purposes Person Trips Intrazonal - Transit Total",                       "trip"),
+    "TOTAL_INTRA_DAAUTO_PTRIPS":      ("All Purposes Person Trips Intrazonal - Auto Drive Alone",                    "trip"),
+    "TOTAL_INTRA_SR2AUTO_PTRIPS":     ("All Purposes Person Trips Intrazonal - Auto Shared Ride 2",                  "trip"),
+    "TOTAL_INTRA_SR3AUTO_PTRIPS":     ("All Purposes Person Trips Intrazonal - Auto Shared Ride 3+",                 "trip"),
+    "TOTAL_INTRA_AUTO_PTRIPS":        ("All Purposes Person Trips Intrazonal - Auto Total",                          "trip"),
+    "TOTAL_INTRA_TOT_PTRIPS":         ("All Purposes Person Trips Intrazonal - All Modes Total",                     "trip"),
+    # ── Vehicle Occupancy (VOCC) ─────────────────────────────────────────────
+    "HBW_PRD_NOINTRA_VOCC":   ("HBW Auto Vehicle Occupancy - Produced (No Intrazonals)",      "persons/vehicle"),
+    "HBW_ATT_NOINTRA_VOCC":   ("HBW Auto Vehicle Occupancy - Attracted (No Intrazonals)",     "persons/vehicle"),
+    "HBW_INTRA_VOCC":         ("HBW Auto Vehicle Occupancy - Intrazonal",                     "persons/vehicle"),
+    "HNW_PRD_NOINTRA_VOCC":   ("HNW Auto Vehicle Occupancy - Produced (No Intrazonals)",      "persons/vehicle"),
+    "HNW_ATT_NOINTRA_VOCC":   ("HNW Auto Vehicle Occupancy - Attracted (No Intrazonals)",     "persons/vehicle"),
+    "HNW_INTRA_VOCC":         ("HNW Auto Vehicle Occupancy - Intrazonal",                     "persons/vehicle"),
+    "NHB_PRD_NOINTRA_VOCC":   ("NHB Auto Vehicle Occupancy - Produced (No Intrazonals)",      "persons/vehicle"),
+    "NHB_ATT_NOINTRA_VOCC":   ("NHB Auto Vehicle Occupancy - Attracted (No Intrazonals)",     "persons/vehicle"),
+    "NHB_INTRA_VOCC":         ("NHB Auto Vehicle Occupancy - Intrazonal",                     "persons/vehicle"),
+    "TOTAL_PRD_NOINTRA_VOCC": ("All Purposes Auto Vehicle Occupancy - Produced (No Intrazonals)", "persons/vehicle"),
+    "TOTAL_ATT_NOINTRA_VOCC": ("All Purposes Auto Vehicle Occupancy - Attracted (No Intrazonals)","persons/vehicle"),
+    "TOTAL_INTRA_VOCC":       ("All Purposes Auto Vehicle Occupancy - Intrazonal",               "persons/vehicle"),
+}
+
+def _build_modechoice_system_section():
+    """Build the MODE CHOICE COLUMNS section of the system prompt from MODECHOICE_META."""
+    lines = [
+        "MODE CHOICE COLUMNS (county_modechoice, city_modechoice, mpa_modechoice)",
+        "  The geography key column (first column) is COUNTY, CITY, or MPA12 depending on the table.",
+        "  All other columns are numeric. Column naming pattern:",
+        "    <PURPOSE>_<DIRECTION>_<INTRA>_<MODE>_PTRIPS  — person trips",
+        "    <PURPOSE>_<DIRECTION>_<INTRA>_VOCC            — vehicle occupancy (persons/vehicle)",
+        "",
+        "  Segment codes:",
+        "    PURPOSE   : HBW=Home-Based Work, HNW=Home-Based Non-Work, NHB=Non-Home-Based, TOTAL=All Purposes",
+        "    DIRECTION : PRD=Produced, ATT=Attracted",
+        "    INTRA     : NOINTRA=No Intrazonals (external), INTRA=Intrazonal only",
+        "    MODE      : WLKTR=Transit Walk, DRVTR=Transit Drive, TR=Transit Total,",
+        "                DAAUTO=Auto Drive Alone, SR2AUTO=Auto Shared Ride 2,",
+        "                SR3AUTO=Auto Shared Ride 3+, AUTO=Auto Total, TOT=All Modes Total",
+        "",
+        "  Complete field reference (field_name → description [unit]):",
+    ]
+    for field, (desc, unit) in MODECHOICE_META.items():
+        lines.append(f"    {field:<42} → {desc} [{unit}]")
+    lines += [
+        "",
+        "  COMMON QUERY PATTERNS:",
+        "    Transit mode share (HBW produced, no intrazonals):",
+        "      HBW_PRD_NOINTRA_TR_PTRIPS * 1.0 / NULLIF(HBW_PRD_NOINTRA_TOT_PTRIPS, 0)",
+        "    Auto drive-alone share (all purposes, produced+attracted combined):",
+        "      (TOTAL_PRD_NOINTRA_DAAUTO_PTRIPS + TOTAL_ATT_NOINTRA_DAAUTO_PTRIPS)",
+        "      / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS + TOTAL_ATT_NOINTRA_TOT_PTRIPS, 0)",
+        "    Total person trips including intrazonals (all purposes):",
+        "      TOTAL_PRD_NOINTRA_TOT_PTRIPS + TOTAL_INTRA_TOT_PTRIPS",
+        "    Note: PRD and ATT count the same trip from each end — do NOT sum both",
+        "          unless explicitly comparing productions vs attractions.",
+        "          For a simple trip total, use PRD_NOINTRA + INTRA.",
+    ]
+    return "\n".join(lines)
+
+
+SYSTEM = """You are a travel demand modeling assistant for the North Central Texas region.
+You help analysts query model run data stored in SQLite tables covering three geographic levels:
+COUNTY, CITY, and MPA12 (Metropolitan Planning Area — Inside/Outside/Total).
+
+TABLE OVERVIEW
+==============
+Each level has up to 3 table types. All table names follow the pattern <level>_<type>:
+
+COUNTY-level tables  (rows = individual counties; TOTAL row already excluded at load time)
+  county_demographics  — socioeconomic data per county
+  county_modechoice    — person trips by mode/purpose per county
+  county_perfmeasures  — roadway performance measures per county
+
+CITY-level tables  (rows = individual cities; TOTAL row already excluded at load time)
+  city_demographics    — socioeconomic data per city
+  city_modechoice      — person trips by mode/purpose per city
+  city_perfmeasures    — roadway performance measures per city
+
+MPA12-level tables  (rows = Inside / Outside / Total — all three rows are valid)
+  mpa_demographics     — socioeconomic data for MPA12 zones
+  mpa_modechoice       — person trips by mode/purpose for MPA12 zones
+  mpa_perfmeasures     — roadway performance measures for MPA12 zones
+
+GEOGRAPHY KEY COLUMNS
+=====================
+  county_*  tables: first column is COUNTY
+  city_*    tables: first column is CITY
+  mpa_*     tables: first column is MPA12
+
+DEMOGRAPHICS COLUMNS (county_demographics, city_demographics, mpa_demographics)
+  HHOLD       — households
+  POP         — population
+  BASIC       — basic employment
+  RETAIL      — retail employment
+  SERVICE     — service employment
+  EMP         — total employment
+  LAND_AREA   — land area (sq mi)
+  TOT_AREA    — total area (sq mi)
+  HHSIZE      — average household size
+  PE_RATIO    — population-to-employment ratio
+  POP_DENSITY — population density (persons/sq mi)
+  EMP_DENSITY — employment density (jobs/sq mi)
+  ACT_DENSITY — activity density (persons+jobs/sq mi)
+
+""" + _build_modechoice_system_section() + """
+
+PERFORMANCE MEASURES TABLE COLUMNS (county_perfmeasures, city_perfmeasures, mpa_perfmeasures)
+  <geo_col>   — geography key (COUNTY / CITY / MPA12)
+  section     — metric group (e.g. 'Lane Miles', 'VMT', 'VHT', 'Average Loaded Speed (MPH)',
+                 'Lane Miles at Level of Service F', etc.)
+  funcl       — functional class: 1=Freeways, 2=Principal Arterials, 3=Minor Arterials,
+                 4=Collectors, 6=Freeway Ramps, 7=Frontage Roads
+  description — road description
+  am, pm, op, daily — time-of-day values
+  NOTE: 'Center-Line Miles', 'Lane Miles', and 'Hourly Capacity Miles' sections have
+        no DAILY column — use am, pm, or op for those sections (op is the off-peak/base value).
+        All other sections (VMT, VHT, speeds, LOS, etc.) have all four columns including daily.
+        When reporting values from a section without a daily column, always state which time
+        period (AM, PM, or OP) the numbers refer to, even if the user did not ask.
+        Example: "Dallas has 2,534 freeway lane miles (AM period)."
+        Default use daily value if the user did not specify which time of day to query.
+        If no daily value provided, state which time period the numbers refers to.
+  MPA12 geography values in mpa_perfmeasures: 'Inside', 'Outside', 'Total' (title case).
+  For region-wide totals use mpa_perfmeasures WHERE MPA12='Total'. Example:
+    SELECT funcl, am, pm, op, daily
+    FROM mpa_perfmeasures
+    WHERE section = 'Vehicle Miles of Travel (VMT)' AND MPA12 = 'Total'
+    ORDER BY funcl
+
+OMX TRIP/SKIM TABLES (loaded separately via file upload — may not be present)
+  trips  — columns: origin, destination, purpose (HBW/HNW/NHB), trips
+  skim   — columns: origin, destination, walk_time (minutes)
+
+QUERY RULES
+===========
+- Always use SUM() for trip totals, never COUNT(*)
+- For ranking queries (e.g. "rank Dallas by X", "what is Dallas's rank in Y"):
+  NEVER apply WHERE on the target geography before RANK(). Always rank ALL rows first,
+  then filter in an outer query. Correct pattern:
+    SELECT rank, CITY, EMP_DENSITY
+    FROM (
+        SELECT RANK() OVER (ORDER BY EMP_DENSITY DESC) AS rank, CITY, EMP_DENSITY
+        FROM city_demographics
+    )
+    WHERE CITY = 'Dallas'
+  Wrong pattern (returns rank 1 always): SELECT RANK() OVER (...) FROM city_demographics WHERE CITY = 'Dallas'
+- TOTAL rows are already excluded from county_* and city_* tables — no need to filter them
+- For MPA12 queries, Inside/Outside/Total rows are all present — include/exclude per user intent
+- For performance measure queries: filter by section to select the metric,
+  filter by the geo column for geography
+- For mode share calculations always guard against divide-by-zero with NULLIF(..., 0)
+- Do NOT sum PRD and ATT for the same trip purpose — they represent the same trips from
+  each end of the trip; use PRD only (or ATT only) for directional totals
+- Intrazonal trips: origin = destination (trips table); or INTRA columns (modechoice tables)
+- The modechoice_metadata table (field, description, unit) can be queried to look up
+  any column definition
+- For mode share queries, prefer a WIDE single-row SELECT (one column per mode) rather than
+  UNION ALL with one row per mode. Example for Dallas county mode share:
+    SELECT COUNTY,
+           ROUND(TOTAL_PRD_NOINTRA_WLKTR_PTRIPS * 100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS transit_walk_pct,
+           ROUND(TOTAL_PRD_NOINTRA_DRVTR_PTRIPS * 100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS transit_drive_pct,
+           ROUND(TOTAL_PRD_NOINTRA_TR_PTRIPS    * 100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS transit_total_pct,
+           ROUND(TOTAL_PRD_NOINTRA_DAAUTO_PTRIPS* 100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS drive_alone_pct,
+           ROUND(TOTAL_PRD_NOINTRA_SR2AUTO_PTRIPS*100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS sr2_pct,
+           ROUND(TOTAL_PRD_NOINTRA_SR3AUTO_PTRIPS*100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS sr3_pct,
+           ROUND(TOTAL_PRD_NOINTRA_AUTO_PTRIPS  * 100.0 / NULLIF(TOTAL_PRD_NOINTRA_TOT_PTRIPS,0), 2) AS auto_total_pct
+    FROM county_modechoice WHERE COUNTY = 'Dallas'
+  This produces one compact row instead of 7+ UNION ALL blocks.
+"""
+
+
+# ── SQLite performance settings ───────────────────────────────────────────────
+def fast_sqlite_settings(conn):
+    conn.execute("PRAGMA journal_mode = OFF")
+    conn.execute("PRAGMA synchronous = OFF")
+    conn.execute("PRAGMA cache_size = 1000000")
+    conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+    conn.execute("PRAGMA temp_store = MEMORY")
+
+
+# ── Trip OMX loader ───────────────────────────────────────────────────────────
+def load_one_core(args):
+    core, matrix, zone_ids, conn = args
+    n = matrix.shape[0]
+    origins      = np.repeat(zone_ids, n)
+    destinations = np.tile(zone_ids, n)
+    values       = matrix.flatten()
+    mask         = values > 0
+    df = pd.DataFrame({
+        "origin":      origins[mask],
+        "destination": destinations[mask],
+        "purpose":     core.replace("new_", "").upper(),
+        "trips":       values[mask],
+    })
+    with WRITE_LOCK:
+        df.to_sql("trips", conn, if_exists="append", index=False,
+                  method="multi", chunksize=50_000)
+    return core, len(df)
+
+
+def load_omx_trips(path, conn):
+    fast_sqlite_settings(conn)
+    with omx.open_file(path, "r") as f:
+        try:
+            zone_ids = list(f.mapping("zone_id"))
+        except Exception:
+            zone_ids = list(range(1, f.shape()[0] + 1))
+        cores    = [core for core in f.list_matrices() if core != "new_all"]
+        matrices = {core: np.array(f[core]) for core in cores}
+
+    conn.execute("DROP TABLE IF EXISTS trips")
+    conn.execute("""
+        CREATE TABLE trips (
+            origin      INTEGER,
+            destination INTEGER,
+            purpose     TEXT,
+            trips       REAL
+        )
+    """)
+    args = [(core, matrices[core], zone_ids, conn) for core in cores]
+    with ThreadPoolExecutor(max_workers=len(cores)) as ex:
+        results = list(ex.map(load_one_core, args))
+
+    conn.execute("CREATE INDEX idx_trips_purpose ON trips(purpose)")
+    conn.execute("CREATE INDEX idx_trips_od      ON trips(origin, destination)")
+    conn.commit()
+    total_rows = sum(r[1] for r in results)
+    print(f"Trips loaded: {total_rows:,} non-zero rows across {len(cores)} cores, {len(zone_ids)} zones")
+    return cores, len(zone_ids)
+
+
+def load_omx_skim(path, conn):
+    with omx.open_file(path, "r") as f:
+        try:
+            zone_ids = list(f.mapping("zone_id"))
+        except Exception:
+            zone_ids = list(range(1, f.shape()[0] + 1))
+        core_name = list(f.list_matrices())[0]
+        matrix    = np.array(f[core_name])
+
+    n    = matrix.shape[0]
+    vals = matrix.flatten()
+    mask = vals > 0
+    df = pd.DataFrame({
+        "origin":      np.repeat(zone_ids, n)[mask],
+        "destination": np.tile(zone_ids, n)[mask],
+        "walk_time":   vals[mask],
+    })
+    df.to_sql("skim", conn, if_exists="replace", index=False,
+              method="multi", chunksize=50_000)
+    conn.execute("CREATE INDEX idx_skim_od ON skim(origin, destination)")
+    conn.commit()
+    print(f"Skim loaded: {len(df):,} non-zero rows, core: {core_name}")
+    return core_name
+
+
+# ── Schema extractor ──────────────────────────────────────────────────────────
+def get_schema(conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+    tables = [r[0] for r in cursor.fetchall()]
+    lines  = ["DATABASE SCHEMA:"]
+    for table in tables:
+        cursor.execute(f"PRAGMA table_info({table})")
+        cols = cursor.fetchall()
+
+        # For wide modechoice tables, only show the geo key + column count to avoid
+        # flooding the context — the full field reference is already in the system prompt.
+        if table.endswith("_modechoice"):
+            geo_key = cols[0][1] if cols else "?"
+            lines.append(
+                f"\nTable: {table}\n"
+                f"  Columns: {geo_key} (TEXT) + {len(cols)-1} numeric mode-choice columns"
+                f" — see MODE CHOICE COLUMNS in system prompt for full field reference\n"
+                f"  Rows: {pd.read_sql(f'SELECT COUNT(*) AS n FROM {table}', conn).iloc[0,0]}"
+            )
+            continue
+
+        col_str = ", ".join(f"{c[1]} ({c[2]})" for c in cols)
+        lines.append(f"\nTable: {table}\n  Columns: {col_str}")
+
+    # Actual row values, including distinct sections, stay in SQLite.
+    lines += ["", "NOTES:", "  Intrazonal trips: origin=destination (trips table)",
+              "  TLD: join trips+skim, bin walk_time"]
+    return "\n".join(lines)
+
+
+# ── Performance Measures CSV parser ──────────────────────────────────────────
+def parse_perf_csv(csv_path, geo_col):
+    """
+    Parse a TAFT performance measures CSV.
+    geo_col: the name to use for the geography column (COUNTY, CITY, or MPA12).
+    Returns a list of dicts with {geo_col, section, funcl, description, am, pm, op, daily}.
+    Handles nested structures (e.g., FUNCL -> LOS ABC/DE/F) by carrying forward FUNCL.
+    """
+    area_name = os.path.splitext(os.path.basename(csv_path))[0].split("_")[-1].title()
+
+    rows = []
+    current_section = None
+    last_funcl = None
+    last_description = None
+    # Tracks which TOD columns the current section's header declared.
+    # Some sections (Lane Miles, Center-Line Miles, Hourly Capacity Miles) only have
+    # AM/PM/OP — no DAILY column.  We detect this from the "FUNCL,DESCRIPTION,..." header
+    # and store the positional mapping so data rows are assigned correctly.
+    section_col_map = {"am": 2, "pm": 3, "op": 4, "daily": 5}  # default: all four present
+
+    with open(csv_path, newline="", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line  = line.rstrip("\n")
+            parts = [p.strip() for p in line.split(",")]
+
+            if not parts[0]:
+                continue
+
+            if parts[0] == "TOTAL":
+                continue
+
+            # "FUNCL,DESCRIPTION,AM,PM,OP[,DAILY]" header — capture which columns exist
+            if parts[0] == "FUNCL":
+                header = [p.upper() for p in parts]
+                col_map = {}
+                for tod in ("am", "pm", "op", "daily"):
+                    try:
+                        col_map[tod] = header.index(tod.upper())
+                    except ValueError:
+                        col_map[tod] = None
+                section_col_map = col_map
+                continue
+
+            # Detect section header: non-numeric first column, no numeric data in row
+            if not _is_numeric(parts[0]) and (len(parts) < 2 or parts[1] in ("", "AM", "PM", "OP", "DAILY", "% Daily", "[Min LOS]")):
+                if len(parts) > 1 and parts[1] == "DESCRIPTION":
+                    continue
+                current_section = parts[0]
+                last_funcl = None
+                last_description = None
+                # Reset to default until the next FUNCL header is seen
+                section_col_map = {"am": 2, "pm": 3, "op": 4, "daily": 5}
+                continue
+
+            def _get_tod(p, idx):
+                if idx is None or idx >= len(p):
+                    return None
+                return _to_float(p[idx])
+
+            # Parse numeric FUNCL row (e.g., "1,FREEWAYS,...")
+            if _is_numeric(parts[0]) and parts[1]:
+                last_funcl = int(float(parts[0]))
+                last_description = parts[1]
+                try:
+                    rows.append({
+                        geo_col:       area_name,
+                        "section":     current_section,
+                        "funcl":       last_funcl,
+                        "description": last_description,
+                        "am":          _get_tod(parts, section_col_map.get("am")),
+                        "pm":          _get_tod(parts, section_col_map.get("pm")),
+                        "op":          _get_tod(parts, section_col_map.get("op")),
+                        "daily":       _get_tod(parts, section_col_map.get("daily")),
+                    })
+                except Exception:
+                    pass
+
+            # Parse nested sub-row (e.g., ",LOS ABC,47.15,...") by carrying forward FUNCL
+            elif not _is_numeric(parts[0]) and len(parts) >= 3 and parts[1] and _to_float(parts[2]) is not None and last_funcl is not None:
+                try:
+                    rows.append({
+                        geo_col:       area_name,
+                        "section":     current_section,
+                        "funcl":       last_funcl,
+                        "description": f"{last_description} - {parts[1]}",
+                        "am":          _get_tod(parts, section_col_map.get("am")),
+                        "pm":          _get_tod(parts, section_col_map.get("pm")),
+                        "op":          _get_tod(parts, section_col_map.get("op")),
+                        "daily":       _get_tod(parts, section_col_map.get("daily")),
+                    })
+                except Exception:
+                    pass
+
+    sections_found = list({r["section"] for r in rows if r["section"]})
+    print(f"  [{area_name}] {len(rows)} rows, sections: {sorted(sections_found)}")
+    return rows
+
+
+def _is_numeric(s):
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _to_float(s):
+    try:
+        return float(s) if s.strip() != "" else None
+    except (ValueError, TypeError):
+        return None
+
+
+# ── Scenario loader helpers ───────────────────────────────────────────────────
+# Maps level folder name → (geo column name, table prefix, rows to exclude)
+LEVEL_CONFIG = {
+    "COUNTY": {
+        "geo_col":  "COUNTY",
+        "prefix":   "county",
+        "exclude":  {"total", "external"},
+    },
+    "CITY": {
+        "geo_col":  "CITY",
+        "prefix":   "city",
+        "exclude":  {"total"},
+    },
+    "MPA12": {
+        "geo_col":  "MPA12",
+        "prefix":   "mpa",
+        "exclude":  set(),          # Inside / Outside / Total are all valid
+    },
+}
+
+# CSV filename patterns to table suffix
+CSV_PATTERNS = [
+    ("Demographics_Summary", "demographics"),
+    ("ModeChoice_Summary",   "modechoice"),
+]
+
+
+def _load_flat_csv(csv_path, geo_col, exclude_set):
+    """Load a wide-format CSV (demographics or modechoice), drop excluded geo rows.
+
+    These CSVs have a trailing comma on every data row (one more comma than header),
+    which causes pandas to silently promote the header into a row index and shift all
+    column names one position to the right.  index_col=False suppresses that behavior;
+    dropna(axis=1, how='all') then removes the phantom empty column the trailing comma creates.
+    skipinitialspace=True strips the leading space from every numeric value.
+    """
+    df = pd.read_csv(csv_path, encoding="utf-8", skipinitialspace=True,
+                     index_col=False, on_bad_lines="skip")
+    df = df.dropna(axis=1, how="all")          # remove phantom trailing empty column
+    df.columns = df.columns.str.strip()
+    if geo_col in df.columns:
+        df = df[~df[geo_col].astype(str).str.strip().str.lower().isin(exclude_set)]
+    return df
+
+
+def load_scenario_data(folder, conn):
+    """
+    Load all CSV data for a model run into SQLite.
+    Creates tables: county_demographics, county_modechoice, county_perfmeasures,
+                    city_demographics,   city_modechoice,   city_perfmeasures,
+                    mpa_demographics,    mpa_modechoice,    mpa_perfmeasures
+    Returns a summary dict.
+    """
+    base = os.path.join(MODEL_RUNS_ROOT, folder, "Reports", "ModelRunReports")
+    summary = {}
+
+    for level_folder, cfg in LEVEL_CONFIG.items():
+        level_dir = os.path.join(base, level_folder)
+        if not os.path.isdir(level_dir):
+            print(f"  Skipping {level_folder}: folder not found")
+            continue
+
+        geo_col    = cfg["geo_col"]
+        prefix     = cfg["prefix"]
+        exclude    = cfg["exclude"]
+
+        # ── Flat CSVs: demographics and modechoice ────────────────────────────
+        for fname in os.listdir(level_dir):
+            if not fname.lower().endswith(".csv"):
+                continue
+            for pattern, suffix in CSV_PATTERNS:
+                if pattern in fname:
+                    table_name = f"{prefix}_{suffix}"
+                    path = os.path.join(level_dir, fname)
+                    try:
+                        df = _load_flat_csv(path, geo_col, exclude)
+                        df.to_sql(table_name, conn, if_exists="replace", index=False)
+                        conn.commit()
+                        summary[table_name] = len(df)
+                        print(f"  Loaded {table_name}: {len(df)} rows from {fname}")
+                    except Exception as e:
+                        print(f"  Error loading {fname}: {e}")
+                    break
+
+        # ── Performance measures CSV per area ─────────────────────────────────
+        perf_dir = os.path.join(level_dir, "PerformanceMeasures")
+        if os.path.isdir(perf_dir):
+            table_name = f"{prefix}_perfmeasures"
+            all_rows   = []
+            for fname in os.listdir(perf_dir):
+                if not fname.lower().endswith(".csv"):
+                    continue
+                area_name = os.path.splitext(fname)[0].split("_")[-1]
+                if area_name.lower() in {e.lower() for e in exclude}:
+                    print(f"  Skipping {fname} ({area_name} excluded)")
+                    continue
+                path = os.path.join(perf_dir, fname)
+                try:
+                    rows = parse_perf_csv(path, geo_col)
+                    all_rows.extend(rows)
+                except Exception as e:
+                    print(f"  Skipping {fname}: {e}")
+
+            if all_rows:
+                df = pd.DataFrame(all_rows)
+                df.to_sql(table_name, conn, if_exists="replace", index=False)
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_geo "
+                             f"ON {table_name}({geo_col})")
+                conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_section "
+                             f"ON {table_name}(section)")
+                conn.commit()
+                summary[table_name] = len(df)
+                print(f"  Loaded {table_name}: {len(df)} rows from {len(all_rows)} perf records")
+
+    # ── Mode choice metadata lookup table ─────────────────────────────────────
+    meta_rows = [
+        {"field": field, "description": desc, "unit": unit}
+        for field, (desc, unit) in MODECHOICE_META.items()
+    ]
+    pd.DataFrame(meta_rows).to_sql(
+        "modechoice_metadata", conn, if_exists="replace", index=False
+    )
+    conn.commit()
+    print(f"  Loaded modechoice_metadata: {len(meta_rows)} field definitions")
+
+    return summary
+
+
+# ── SQL generation ────────────────────────────────────────────────────────────
+def generate_sql(question, schema, error=None):
+    if error:
+        prompt = (f"{schema}\n\nUser asked: \"{question}\"\n"
+                  f"Previous SQL failed: {error}\n"
+                  f"Write corrected SQLite SQL. Return ONLY raw SQL.")
+    else:
+        prompt = (f"{schema}\n\nUser asked: \"{question}\"\n"
+                  f"Write a single SQLite SQL query. Return ONLY raw SQL, no markdown, no backticks.")
+    sql = llm_chat(SYSTEM, prompt, max_tokens=1200)
+    sql = re.sub(r"^```(?:sql)?|```$", "", sql, flags=re.MULTILINE).strip()
+    return sql
+
+
+def run_query(sql, conn):
+    if not sql.strip().upper().startswith("SELECT"):
+        return None, "Only SELECT queries allowed."
+    try:
+        return pd.read_sql(sql, conn), None
+    except Exception as e:
+        return None, str(e)
+
+
+def run_with_retry(question, schema, conn, max_retries=3):
+    error, sql = None, None
+    for attempt in range(1, max_retries + 1):
+        sql      = generate_sql(question, schema, error)
+        df, error = run_query(sql, conn)
+        if error is None:
+            return df, sql, attempt, None
+        if _missing_report_table(error, conn):
+            break                       # the data isn't in this run; retrying can't help
+    return None, sql, attempt, error
+
+
+# The report tables load_scenario_data() can create. A run without the report behind one
+# (older runs have no ModeChoice_Summary CSV, some have no CITY folder) never gets that table.
+_LEVEL_FOLDERS  = {"county": "COUNTY", "city": "CITY", "mpa": "MPA12"}
+_REPORT_SOURCES = {"demographics": "Demographics_Summary CSV",
+                   "modechoice":   "ModeChoice_Summary CSV",
+                   "perfmeasures": "PerformanceMeasures folder"}
+_REPORT_TABLES  = {f"{level}_{kind}" for level in _LEVEL_FOLDERS for kind in _REPORT_SOURCES}
+
+
+def _table_names(conn):
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _missing_report_table(error, conn):
+    """The report table a failed query needed when the loaded run never had it, else None."""
+    m = re.search(r"no such table: (\w+)", str(error or ""))
+    if not m:
+        return None
+    name = m.group(1)
+    base = re.sub(r"_[ab]$", "", name)
+    if base not in _REPORT_TABLES:
+        return None                     # a name the model got wrong; a retry may fix it
+    if name == base and {f"{base}_a", f"{base}_b"} & _table_names(conn):
+        return None                     # compare mode: the model left off the _a/_b suffix
+    return name
+
+
+def _query_error(error, attempts, conn, folders):
+    """Message for a question whose SQL never ran. folders: {slot: model run folder}."""
+    missing = _missing_report_table(error, conn)
+    if not missing:
+        return f"Query failed after {attempts} attempt(s): {error}"
+    base = re.sub(r"_[ab]$", "", missing)
+    level, kind = base.split("_", 1)
+    if len(folders) > 1:                # compare mode: name every run that lacks it
+        existing = _table_names(conn)
+        slots = [s for s in folders if f"{base}_{s.lower()}" not in existing]
+    else:
+        slots = list(folders)
+    runs = " and ".join(f"Scenario {s} ({folders[s]})" for s in slots)
+    return (f"No {base} data in {runs}: there is no {_REPORT_SOURCES[kind]} in "
+            f"Reports\\ModelRunReports\\{_LEVEL_FOLDERS[level]}, so this question can't be "
+            f"answered from {'these runs' if len(slots) > 1 else 'this run'}. "
+            "Load a model run that includes that report.")
+
+
+def _local_result_summary(df):
+    if df.empty:
+        return "No rows matched the query."
+    preview = df.head(5).to_string(index=False)
+    return f"Query returned {len(df):,} row(s). First rows:\n{preview}"
+
+
+# How the model writes answers from query results. A 14B model misranks and miscalculates
+# numbers in a raw table, so _result_text() works those out first and the model only quotes.
+SUMMARY_STYLE = ("Write plain prose in the same language as the user's question: no tables, "
+                 "bullet lists or SQL. The facts above the result table were computed exactly "
+                 "from all rows: take every highest, lowest or ranking statement from them and "
+                 "quote numbers exactly as written. Do not calculate new totals, averages or "
+                 "percentages. When columns are time periods (am, pm, op, daily), say which "
+                 "period the numbers you quote belong to.")
+
+
+def _fmt_number(v):
+    """1,434,390 / 896,379.8 / 12.35 / 0.0274: digits grouped so magnitudes are easy to read."""
+    if v is None or not _math.isfinite(v):
+        return "NULL"
+    if v == int(v):
+        return f"{int(v):,}"
+    if abs(v) >= 1000:
+        return f"{v:,.1f}"
+    if abs(v) >= 1:
+        return f"{v:,.2f}".rstrip("0").rstrip(".")
+    return f"{v:.4g}"
+
+
+def _result_text(df, question=""):
+    """The query result as text for the model: exact B-vs-A changes for <x>_a/<x>_b
+    columns, rows sorted by the measure the question asks about, and each measure's
+    highest and lowest rows stated up front."""
+    d = df.copy()
+    has_change = any(_CHANGE_RE.search(str(c)) for c in d.columns)
+    for base, a, b in _scenario_pairs(d.select_dtypes(include="number").columns):
+        if not has_change:
+            d[f"{base}_change_b_minus_a"] = d[b] - d[a]
+        d[f"{base}_pct_change_vs_a"] = ((d[b] - d[a]) / d[a].where(d[a] != 0) * 100).round(1)
+
+    funcl = next((c for c in d.columns if str(c).lower() == "funcl"), None)
+    if funcl is not None:
+        d[funcl] = d[funcl].map(_funcl_label)          # "Freeways" rather than 1
+    measures = [c for c in d.select_dtypes(include="number").columns
+                if not _RANK_RE.search(str(c))]
+    geo = [c for c in d.columns if str(c).lower() in ("county", "city", "mpa12")]
+    text_cols = [c for c in d.columns if c not in measures and c not in geo]
+    cats = _label_columns(d, geo + text_cols)
+    facts = []
+    if measures and cats and len(d) > 1:
+        main = _primary(measures, question.lower())
+        d = d.sort_values(main, ascending=False, na_position="last")
+        labels = d[cats].astype(str).agg(" · ".join, axis=1)
+        for m in [main] + [c for c in measures if c != main][:5]:
+            s = pd.DataFrame({"label": labels, "v": pd.to_numeric(d[m], errors="coerce")}).dropna()
+            if len(s) < 2:
+                continue
+            hi, lo = s.loc[s.v.idxmax()], s.loc[s.v.idxmin()]
+            line = (f"- {m}: highest {hi.label} ({_fmt_number(hi.v)}), "
+                    f"lowest {lo.label} ({_fmt_number(lo.v)})")
+            if lo.v == 0 and (s.v > 0).any():
+                above = s[s.v > 0]
+                low2 = above.loc[above.v.idxmin()]
+                line += f", lowest above zero {low2.label} ({_fmt_number(low2.v)})"
+            facts.append(line)
+        facts.append(f"Rows below are sorted by {main}, highest first.")
+
+    for c in d.select_dtypes(include="number").columns:
+        d[c] = pd.to_numeric(d[c], errors="coerce").astype(float).map(_fmt_number)
+    table = (d.head(20).to_string(index=False) + f"\n...({len(d)} rows)" if len(d) > 50
+             else d.to_string(index=False))
+    if not facts:
+        return table
+    return f"Facts computed from all {len(d):,} rows:\n" + "\n".join(facts) + "\n\n" + table
+
+
+def _llm_summary(prompt, max_tokens, fallback):
+    try:
+        return llm_chat(SYSTEM, prompt, max_tokens=max_tokens)
+    except Exception as e:      # still show the query result, just without the prose
+        print(f"[summary] LLM summary failed, showing the result preview instead: {e}")
+        return fallback
+
+
+def summarize(question, sql, df):
+    local = _local_result_summary(df)
+    if not LLM_SEND_RESULTS or df.empty:
+        return local
+    return _llm_summary(
+        f"User asked: {question}\nSQL: {sql}\nResult:\n{_result_text(df, question)}\n"
+        "Summarize in 2-3 sentences for a travel demand modeler or traffic planner. "
+        "Mention specific numbers. " + SUMMARY_STYLE,
+        512, local)
+
+
+# ── Chart type detector ───────────────────────────────────────────────────────
+def detect_chart_type(question):
+    """Return 'bar', 'line', 'pie', or 'scatter' based on keywords in the question."""
+    q = question.lower()
+    if any(k in q for k in ["pie chart", "pie graph", "pie plot", "donut", "doughnut"]):
+        return "pie"
+    if any(k in q for k in ["line chart", "line graph", "line plot", "trend", "over time",
+                             "time series", "timeseries"]):
+        return "line"
+    if any(k in q for k in ["scatter", "scatter plot", "scatter chart", "scatterplot"]):
+        return "scatter"
+    # bar is the default — also explicit keywords
+    return "bar"
+
+
+# ── Chart builder (Plotly) ────────────────────────────────────────────────────
+# make_chart() returns a Plotly figure as a JSON-safe dict ({"data": [...], "layout": {...}})
+# that the page draws with plotly.js. Flask serves plotly.js from this plotly install
+# (/plotly.min.js), so the library always matches the figures built here. Values go in as
+# plain lists: plotly>=6 base64-encodes numpy arrays, which older plotly.js cannot read.
+FUNCL_LABELS = {
+    1: "Freeways",
+    2: "Principal Arterials",
+    3: "Minor Arterials",
+    4: "Collectors",
+    6: "Freeway Ramps",
+    7: "Frontage Roads",
+}
+TOD_COLS   = ["am", "pm", "op", "daily"]
+TOD_COLORS = {"am": "#39d353", "pm": "#58a6ff", "op": "#f78166", "daily": "#d2a8ff"}
+
+# Categorical slots, used in this order and never cycled (pies fold the tail into "Other").
+SERIES_COLORS   = ["#39d353", "#58a6ff", "#f78166", "#d2a8ff", "#ffa657", "#f778ba"]
+FUNCL_COLORS    = dict(zip(FUNCL_LABELS.values(), SERIES_COLORS))
+SCENARIO_COLORS = {"A": "#39d353", "B": "#bc8cff"}     # same accents as the A/B tags in the page
+CHANGE_COLORS   = {"up": "#58a6ff", "down": "#f78166"}
+OTHER_COLOR     = "#6e7681"
+
+CHART_BG, CHART_PANEL, CHART_GRID, CHART_AXIS = "#0d1117", "#161b22", "#21262d", "#30363d"
+CHART_TEXT, CHART_INK = "#8b949e", "#e6edf3"
+CHART_FONT       = "DM Sans, Segoe UI, Arial, sans-serif"
+CHART_HEIGHT     = 420
+MAX_LABELED_BARS = 24    # past this many bars, values live in the hover and the raw-data table
+
+CHART_TEMPLATE = go.layout.Template(layout=dict(
+    paper_bgcolor=CHART_BG, plot_bgcolor=CHART_BG,
+    font=dict(family=CHART_FONT, size=12, color=CHART_TEXT),
+    colorway=SERIES_COLORS,
+    title=dict(x=0.01, xanchor="left", font=dict(size=14, color=CHART_INK)),
+    xaxis=dict(showgrid=False, linecolor=CHART_AXIS, ticks="outside", tickcolor=CHART_AXIS,
+               zeroline=False, automargin=True),
+    yaxis=dict(gridcolor=CHART_GRID, linecolor=CHART_AXIS, zerolinecolor=CHART_AXIS,
+               separatethousands=True, automargin=True),
+    legend=dict(orientation="h", x=0, xanchor="left", y=1.02, yanchor="bottom",
+                bgcolor="rgba(0,0,0,0)", font=dict(size=11)),
+    hoverlabel=dict(bgcolor=CHART_PANEL, bordercolor=CHART_AXIS,
+                    font=dict(family=CHART_FONT, size=12, color=CHART_INK)),
+    bargroupgap=0.08, barcornerradius=4,
+    uniformtext=dict(minsize=8, mode="hide"),   # labels shrink to the bar width, hide below 8px
+))
+
+_AB_SUFFIX_RE = re.compile(r"^(.+?)_([ab])$", re.I)      # emp_a / emp_b
+_AB_PREFIX_RE = re.compile(r"^([ab])_(.+)$", re.I)       # a_emp / b_emp
+_CHANGE_RE    = re.compile(r"delta|diff|change|chg|growth|increase|decrease", re.I)
+_PCT_RE       = re.compile(r"pct|percent|share|proportion", re.I)
+_RANK_RE      = re.compile(r"(^|_)(rank|rnk|rn|row_?num(ber)?|id)($|_)", re.I)
+_SCENARIO_SLOTS = {"a": "A", "scenario a": "A", "scenario_a": "A", "base": "A",
+                   "b": "B", "scenario b": "B", "scenario_b": "B", "build": "B",
+                   "alt": "B", "alternative": "B"}
+_FUNCL_ORDER = list(FUNCL_LABELS.values())
+
+
+def _funcl_label(v):
+    try:
+        return FUNCL_LABELS.get(int(float(v)), str(v))
+    except (TypeError, ValueError):
+        return v
+
+
+def _funcl_order(label):
+    return _FUNCL_ORDER.index(label) if label in _FUNCL_ORDER else len(_FUNCL_ORDER)
+
+
+def _num_list(values):
+    """Plain list of floats (NaN becomes null in the JSON)."""
+    return pd.to_numeric(pd.Series(list(values), dtype=object), errors="coerce").astype(float).tolist()
+
+
+def _compact(v, pct=False, signed=False):
+    """Short bar-tip label (1,284 / 12.9K / 4.2M); the hover keeps the full value."""
+    if v is None or not _math.isfinite(v):
+        return ""
+    sign = "+" if signed and v > 0 else ""
+    if pct:
+        return f"{sign}{v:,.1f}%"
+    for size, suffix in ((1e9, "B"), (1e6, "M"), (1e4, "K")):
+        if abs(v) >= size:
+            div = 1e3 if suffix == "K" else size
+            return f"{sign}{v / div:,.1f}".removesuffix(".0") + suffix
+    if v == int(v) or abs(v) >= 100:
+        return f"{sign}{v:,.0f}"
+    return sign + f"{v:,.{1 if abs(v) >= 10 else 2}f}".rstrip("0").rstrip(".")
+
+
+def _hover_fmt(values):
+    """d3 number format for the hover, with precision scaled to the data."""
+    m = max((abs(v) for v in values if v is not None and _math.isfinite(v)), default=0)
+    return ",.4~f" if m < 1 else ",.2~f" if m < 100 else ",.1~f" if m < 10_000 else ",.0f"
+
+
+def _unique_labels(labels):
+    """Category labels as strings; a repeated label gets a counter so bars never overlap."""
+    seen, out = {}, []
+    for label in (str(v) for v in labels):
+        seen[label] = seen.get(label, 0) + 1
+        out.append(label if seen[label] == 1 else f"{label} ({seen[label]})")
+    return out
+
+
+def _is_tod_column(s):
+    vals = s.dropna().astype(str).str.lower().unique()
+    return len(vals) >= 1 and all(v in TOD_COLS for v in vals)
+
+
+def _category_column(df, text):
+    """First text column that actually varies (skips e.g. the section filtered on)."""
+    return next((c for c in text if df[c].nunique() > 1), text[0])
+
+
+def _measure_title(df, default):
+    """The perf-measure section name when the result covers exactly one section."""
+    col = next((c for c in df.columns if str(c).lower() == "section"), None)
+    if col is not None:
+        vals = df[col].dropna().unique()
+        if len(vals) == 1:
+            return str(vals[0])
+    return default
+
+
+def _primary(values, q):
+    """The measure the question asks about (column-name overlap), else the first one."""
+    candidates = [c for c in values if not _RANK_RE.search(str(c))] or values
+    words = re.findall(r"[a-z0-9]+", q)
+
+    def score(col):
+        # "emp" matches "employment"; short tokens ("tr") only match a whole word.
+        tokens = [t for t in re.split(r"[^a-z0-9]+", str(col).lower()) if len(t) >= 2]
+        hits = sum(any(w == t or (len(t) >= 3 and w.startswith(t)) for w in words)
+                   for t in tokens)
+        return hits, hits / max(len(tokens), 1)
+    return max(candidates, key=score)
+
+
+def _comparable(df, a, b):
+    """Same kind of measure (both shares or both amounts) and within 10x in size."""
+    if (bool(_PCT_RE.search(str(a))) != bool(_PCT_RE.search(str(b)))
+            or _CHANGE_RE.search(str(b)) or _RANK_RE.search(str(b))):
+        return False
+    ma = pd.to_numeric(df[a], errors="coerce").abs().max()
+    mb = pd.to_numeric(df[b], errors="coerce").abs().max()
+    return bool(ma > 0 and mb > 0 and max(ma, mb) / min(ma, mb) <= 10)
+
+
+def _per_bar_colors(labels):
+    """Bars that are time periods or scenarios keep their fixed colors."""
+    low = [str(v).strip().lower() for v in labels]
+    if all(v in TOD_COLORS for v in low):
+        return [TOD_COLORS[v] for v in low]
+    if all(v in _SCENARIO_SLOTS for v in low):
+        return [SCENARIO_COLORS[_SCENARIO_SLOTS[v]] for v in low]
+    return None
+
+
+def _scenario_pairs(cols):
+    """[(measure, col_a, col_b)] for columns named <measure>_a/<measure>_b or a_<measure>/b_<measure>."""
+    found = {}
+    for c in cols:
+        m = _AB_SUFFIX_RE.match(str(c))
+        if m:
+            base, slot = m.group(1), m.group(2)
+        else:
+            m = _AB_PREFIX_RE.match(str(c))
+            if not m:
+                continue
+            slot, base = m.group(1), m.group(2)
+        found.setdefault(base.lower(), [base, {}])[1][slot.upper()] = c
+    return [(base, s["A"], s["B"]) for base, s in found.values() if "A" in s and "B" in s]
+
+
+def _change_column(cols, q):
+    """The B-vs-A change column; percent change when the question asks for percent."""
+    changes = [c for c in cols if _CHANGE_RE.search(str(c))]
+    wants_pct = bool(re.search(r"percent|pct|%", q))
+    changes.sort(key=lambda c: bool(_PCT_RE.search(str(c))) != wants_pct)
+    return changes[0] if changes else None
+
+
+def _scenario_slot_values(s):
+    """The column mapped to 'A'/'B' when every row is tagged with one of the two scenarios."""
+    slots = s.astype(str).str.strip().str.lower().map(_SCENARIO_SLOTS)
+    if s.notna().all() and slots.notna().all() and set(slots) == {"A", "B"}:
+        return slots
+    return None
+
+
+def _widen_scenario_rows(df, numeric, text):
+    """Rows tagged A/B in a scenario column -> one row per category with <measure>_a/_b columns."""
+    scen = next((c for c in text if _scenario_slot_values(df[c]) is not None), None)
+    if scen is None:
+        return df, numeric, text
+    keys = [c for c in text if c != scen]
+    d = df.assign(**{scen: _scenario_slot_values(df[scen])})
+    if keys:
+        wide = d.pivot_table(index=keys, columns=scen, values=numeric, aggfunc="sum", sort=False)
+    else:
+        wide = d.groupby(scen)[numeric].sum().unstack().to_frame().T
+    wide.columns = [f"{measure}_{slot.lower()}" for measure, slot in wide.columns]
+    wide = wide.reset_index() if keys else wide.reset_index(drop=True)
+    return wide, [c for c in wide.columns if c not in keys], keys
+
+
+def _series_trace(x, values, name, color, chart_type="bar", pct=False, label=True,
+                  signed=False, **kw):
+    """One bar or line series over the categories x."""
+    y = _num_list(values)
+    number = "%{y:.1f}%" if pct else "%{y:" + _hover_fmt(y) + "}"
+    hover = "%{fullData.name}: " + number + "<extra></extra>"
+    if chart_type == "line":
+        text = None
+        if label:     # value at the line end only
+            last = max((i for i, v in enumerate(y) if _math.isfinite(v)), default=None)
+            text = [_compact(v, pct, signed) if i == last else "" for i, v in enumerate(y)]
+        return go.Scatter(x=x, y=y, name=name, hovertemplate=hover,
+                          mode="lines+markers+text" if text else "lines+markers",
+                          text=text, textposition="top center",
+                          textfont=dict(size=11, color=CHART_TEXT),
+                          line=dict(color=color, width=2),
+                          marker=dict(size=8, color=color, line=dict(width=2, color=CHART_BG)),
+                          **kw)
+    return go.Bar(x=x, y=y, name=name, marker=dict(color=color), hovertemplate=hover,
+                  text=[_compact(v, pct, signed) for v in y] if label else None,
+                  textposition="outside" if label else "none",
+                  textfont=dict(size=11, color=CHART_TEXT), cliponaxis=False, **kw)
+
+
+def _label_headroom(fig, values, **where):
+    """Stretch the value axis so outside bar labels clear the legend and plot edge."""
+    finite = [v for v in values if _math.isfinite(v)]
+    hi, lo = max(finite, default=0), min(finite, default=0)
+    include = ([hi * 1.12] if hi > 0 else []) + ([lo * 1.12] if lo < 0 else [])
+    if include:
+        fig.update_yaxes(autorangeoptions=dict(include=include), **where)
+
+
+def _distinct_colors(series):
+    """Keep each series' own color; a missing or repeated one takes the next unused slot."""
+    used, out = set(), []
+    for name, vals, color in series:
+        if not isinstance(color, list):         # a list is per-bar colors on a single series
+            if not color or color in used:
+                color = next((c for c in SERIES_COLORS if c not in used), OTHER_COLOR)
+            used.add(color)
+        out.append((name, vals, color))
+    return out
+
+
+def _finish(fig, title="", legend_title=None, height=CHART_HEIGHT, hovermode="x unified",
+            n_categories=0, n_series=0):
+    """Apply the dark theme and spacing, and return the figure as a JSON-safe dict."""
+    has_pie = any(t.type == "pie" for t in fig.data)
+    legend_top = (not has_pie and fig.layout.showlegend is not False
+                  and sum(t.showlegend is not False for t in fig.data) >= 2)
+    fig.update_layout(template=CHART_TEMPLATE, height=height, hovermode=hovermode,
+                      margin=dict(l=12, r=12, b=12, t=16 + 34 * legend_top + 30 * bool(title)))
+    if title:
+        fig.update_layout(title=dict(text=title, y=0.98, yanchor="top"))
+    if legend_title:
+        fig.update_layout(legend_title_text=legend_title)
+    if n_categories and n_series:
+        # Slim bars (about 24px each at a typical chat width) rather than filling the slot.
+        slot  = 760 / n_categories
+        group = min(slot * 0.8, n_series * 26)
+        fig.update_layout(bargap=round(min(0.9, max(0.2, 1 - group / slot)), 2))
+    return json.loads(fig.to_json())
+
+
+def _category_chart(x, series, chart_type, x_title="", y_title="", legend_title=None,
+                    title="", pct=False):
+    """Grouped bars or lines: one trace per (name, values, color) over the categories x."""
+    x = _unique_labels(x)
+    series = _distinct_colors(series)
+    kind = "line" if chart_type == "line" else "bar"
+    # Value labels on a single series only: grouped bars sit too close for them,
+    # and the legend, hover and raw-data table carry those values instead.
+    label = len(series) == 1 and (kind == "line" or len(x) <= MAX_LABELED_BARS)
+    fig = go.Figure([_series_trace(x, vals, name, color, kind, pct=pct, label=label)
+                     for name, vals, color in series])
+    fig.update_xaxes(type="category", title_text=x_title)
+    fig.update_yaxes(title_text=y_title, ticksuffix="%" if pct else None)
+    if len(series) == 1:
+        fig.update_layout(showlegend=False)
+        if label and kind == "bar":
+            _label_headroom(fig, fig.data[0].y)
+    return _finish(fig, title=title, legend_title=legend_title, n_categories=len(x),
+                   n_series=len(series) if kind == "bar" else 0)
+
+
+def _compare_chart(x, x_title, panels, change, chart_type, title=""):
+    """Scenario A vs B. panels: [(measure, a_values, b_values)], one row each.
+    change: (name, values) drawn as its own row under a single panel, or None."""
+    x = _unique_labels(x)
+    if chart_type == "pie":
+        _, a_vals, b_vals = panels[0]
+        return _pie_chart([(x, a_vals, "Scenario A"), (x, b_vals, "Scenario B")], title=title)
+    kind = "line" if chart_type == "line" else "bar"
+    change = change if len(x) > 1 else None
+    rows = len(panels) + bool(change)
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        row_heights=[1.0] * len(panels) + ([0.6] if change else []))
+    for r, (measure, a_vals, b_vals) in enumerate(panels, start=1):
+        for slot, vals in (("A", a_vals), ("B", b_vals)):
+            fig.add_trace(_series_trace(x, vals, f"Scenario {slot}", SCENARIO_COLORS[slot], kind,
+                                        label=False, legendgroup=slot, showlegend=r == 1),
+                          row=r, col=1)
+        fig.update_yaxes(title_text=measure, row=r, col=1)
+    if change:
+        name, vals = change
+        y = _num_list(vals)
+        colors = [CHANGE_COLORS["down"] if v < 0 else CHANGE_COLORS["up"] for v in y]
+        label = len(x) <= MAX_LABELED_BARS
+        fig.add_trace(_series_trace(x, y, name, colors, "bar", signed=True, label=label,
+                                    showlegend=False), row=rows, col=1)
+        fig.update_yaxes(title_text=name, zerolinecolor=CHART_TEXT, row=rows, col=1)
+        if label:
+            _label_headroom(fig, y, row=rows, col=1)
+    fig.update_xaxes(type="category")
+    fig.update_xaxes(title_text=x_title, row=rows, col=1)
+    return _finish(fig, title=title, height=CHART_HEIGHT + 150 * (rows - 1),
+                   n_categories=len(x), n_series=2 if kind == "bar" else int(bool(change)))
+
+
+def _label_columns(df, candidates):
+    """The category columns that name each row, in candidate order."""
+    cats = []
+    for c in dict.fromkeys(c for c in candidates if c is not None):
+        if df[c].nunique() < 2:
+            continue                  # constant, e.g. the section the query filtered on
+        if cats and df.groupby(cats)[c].nunique().max() <= 1:
+            continue                  # implied by the columns already chosen
+        cats.append(c)
+    return cats
+
+
+def _compare_columns(df, candidates, pairs, values, q, chart_type, title):
+    """Scenario A/B columns over the result's category columns (joined when there are several)."""
+    cats = _label_columns(df, candidates)
+    d = df.head(30)
+    x = (d[cats].astype(str).agg(" · ".join, axis=1).tolist() if cats
+         else [str(i + 1) for i in range(len(d))])
+    paired = {c for _, a, b in pairs for c in (a, b)}
+    change_col = _change_column([c for c in values if c not in paired], q)
+    panels = [(base, d[a], d[b]) for base, a, b in pairs[:4]]
+    change = (change_col, d[change_col]) if change_col and len(panels) == 1 else None
+    return _compare_chart(x, " · ".join(map(str, cats)), panels, change, chart_type, title)
+
+
+def _pie_chart(pies, title="", colors=None, hole=0.0):
+    """One pie per (labels, values, name), side by side. More than 6 slices fold into
+    "Other", and a label keeps the same color in every pie."""
+    cleaned = []
+    for labels, values, name in pies:
+        s = pd.Series(_num_list(values), index=[str(v) for v in labels])
+        cleaned.append((s[s > 0].groupby(level=0, sort=False).sum(), name))
+    order = list(dict.fromkeys(label for s, _ in cleaned for label in s.index))
+    if len(order) > 6:
+        totals = pd.concat([s for s, _ in cleaned], axis=1).sum(axis=1)
+        keep = set(totals.sort_values(ascending=False).index[:5])
+        cleaned = [(s.groupby(lambda v: v if v in keep else "Other", sort=False).sum(), name)
+                   for s, name in cleaned]
+        order = [label for label in order if label in keep] + ["Other"]
+    fixed = colors or {}
+    palette = iter([c for c in SERIES_COLORS if c not in fixed.values()])
+    color_of = {label: OTHER_COLOR if label == "Other"
+                else fixed.get(label) or fixed.get(label.lower()) or next(palette, OTHER_COLOR)
+                for label in order}
+    n = len(cleaned)
+    fig = go.Figure()
+    for i, (s, name) in enumerate(cleaned):
+        fig.add_trace(go.Pie(
+            labels=s.index.tolist(), values=s.tolist(), name=name, sort=False,
+            direction="clockwise", hole=hole,
+            domain=dict(x=[i / n + (0.03 if i else 0), (i + 1) / n - (0.03 if i < n - 1 else 0)]),
+            title=dict(text=name, font=dict(color=CHART_INK)) if n > 1 else None,
+            marker=dict(colors=[color_of[label] for label in s.index],
+                        line=dict(color=CHART_BG, width=2)),
+            textinfo="percent", textposition="inside", insidetextorientation="horizontal",
+            textfont=dict(color=CHART_BG),
+            hovertemplate="%{label}<br>%{value:,.2~f} (%{percent})<extra></extra>"))
+    fig.update_layout(legend=dict(orientation="v", x=1.0, xanchor="left", y=0.5, yanchor="middle"))
+    return _finish(fig, title=title, hovermode="closest")
+
+
+def _scatter_chart(df, x_col, y_col, label_col):
+    """Two measures against each other; point names ride along when there are few points."""
+    xs, ys = _num_list(df[x_col]), _num_list(df[y_col])
+    labels = df[label_col].astype(str).tolist() if label_col else None
+    show_text = labels is not None and len(xs) <= 15
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, text=labels, mode="markers+text" if show_text else "markers",
+        textposition="top center", textfont=dict(size=10, color=CHART_TEXT),
+        marker=dict(size=10, color=SERIES_COLORS[0], line=dict(width=2, color=CHART_BG)),
+        hovertemplate=("<b>%{text}</b><br>" if labels else "")
+                      + "%{xaxis.title.text}: %{x:" + _hover_fmt(xs) + "}<br>"
+                      + "%{yaxis.title.text}: %{y:" + _hover_fmt(ys) + "}<extra></extra>"))
+    fig.update_xaxes(title_text=str(x_col), showgrid=True, gridcolor=CHART_GRID)
+    fig.update_yaxes(title_text=str(y_col))
+    return _finish(fig, hovermode="closest")
+
+
+def _histogram_chart(values, name):
+    fig = go.Figure(go.Histogram(x=_num_list(values), nbinsx=20, name=str(name),
+                                 marker=dict(color=SERIES_COLORS[0]),
+                                 hovertemplate="%{x}<br>Count: %{y:,}<extra></extra>"))
+    fig.update_xaxes(title_text=str(name))
+    fig.update_yaxes(title_text="Count")
+    fig.update_layout(bargap=0.04, showlegend=False)
+    return _finish(fig, hovermode="closest")
+
+
+def make_chart(df, question="", chart_type="bar"):
+    """Interactive Plotly chart for a query result: a JSON-safe figure dict, or None."""
+    if df is None or df.empty:
+        return None
+
+    numeric = df.select_dtypes(include="number").columns.tolist()
+    text    = df.select_dtypes(exclude="number").columns.tolist()
+    if not numeric:
+        return None
+
+    q = question.lower()
+    percent_keywords = ["percent", "percentage", "pct", "share", "proportion"]
+    wants_percent = any(k in q for k in percent_keywords)
+    if re.search(r"(percent|percentage|pct|%)\s*(change|difference|diff|increase|decrease|growth)", q):
+        wants_percent = False       # answered by a change column, not a share of the total
+    title = ""
+    pct_values = False              # values are already shares (pct/share columns)
+    unpivoted = False
+
+    # ── Scenario rows tagged A/B in one column -> <measure>_a / <measure>_b columns.
+    df, numeric, text = _widen_scenario_rows(df, numeric, text)
+
+    # ── Wide single-row result: column names are the categories, values are the data.
+    # e.g. SELECT COUNTY, transit_pct, drive_alone_pct, sr2_pct ... WHERE COUNTY='Dallas'
+    # Unpivot so each numeric column becomes a row: (mode, value).
+    if len(df) == 1 and len(numeric) >= 2:
+        row   = df.iloc[0]
+        title = ", ".join(str(row[c]) for c in text if pd.notna(row[c]))
+        pairs = _scenario_pairs(numeric)
+        if pairs and chart_type != "scatter":
+            return _compare_chart([base for base, _, _ in pairs], "",
+                                  [("Value", [row[a] for _, a, _ in pairs],
+                                             [row[b] for _, _, b in pairs])],
+                                  None, chart_type, title)
+        pct_values = all(_PCT_RE.search(str(c)) for c in numeric)
+        df = pd.DataFrame({"mode":  [str(c) for c in numeric],
+                           "value": _num_list(row[numeric])}).dropna(subset=["value"])
+        numeric, text, unpivoted = ["value"], ["mode"], True
+
+    if len(df) < 2:
+        return None
+
+    funcl_col = next((c for c in df.columns if str(c).lower() == "funcl"), None)
+    if funcl_col:
+        df = df.copy()
+        df[funcl_col] = df[funcl_col].map(_funcl_label)
+    county_col = next((c for c in df.columns if str(c).lower() in ("county", "city", "mpa12")), None)
+    values = [c for c in numeric if c != funcl_col]      # measures (funcl is a category now)
+    if not values:
+        return None
+    pairs = _scenario_pairs(values)
+
+    present_tod   = [c for c in values if str(c).lower() in TOD_COLS]
+    period_col    = next((c for c in text if _is_tod_column(df[c])), None)
+    mentioned_tod = [t for t in TOD_COLS if re.search(rf"\b{t}\b", q)]
+    if mentioned_tod:
+        present_tod = [c for c in present_tod if c.lower() in mentioned_tod]
+
+    tod_alias = {}
+    if not present_tod:
+        for col in values:
+            t = next((t for t in (mentioned_tod or TOD_COLS)
+                      if re.search(rf"\b{t}\b|_{t}_|_{t}$|^{t}_", str(col).lower())), None)
+            if t:
+                tod_alias[col] = t
+        present_tod = list(tod_alias)
+
+    def tod_color(col):
+        return TOD_COLORS.get(tod_alias.get(col, str(col).lower()))
+
+    funcl_mentioned = funcl_col and any(
+        re.search(rf"\b{k}\b", q)
+        for k in ["freeway", "freeways", "arterial", "arterials", "collector", "collectors",
+                  "ramp", "ramps", "frontage"] + [str(v) for v in FUNCL_LABELS.keys()]
+    )
+    agg_fn       = "sum" if funcl_mentioned else "mean"
+    has_wide_tod = len(present_tod) >= 2
+    has_long_tod = bool(county_col and period_col)
+    label_col    = county_col or (_category_column(df, text) if text else None)
+
+    print(f"[make_chart] type={chart_type} cols={list(df.columns)} county={county_col} "
+          f"present_tod={present_tod} period_col={period_col} pairs={pairs} "
+          f"mentioned={mentioned_tod} wide={has_wide_tod} long={has_long_tod}")
+
+    # ── Scatter: two measures against each other
+    if chart_type == "scatter" and len(values) >= 2:
+        return _scatter_chart(df.head(50), values[0], values[1], label_col)
+
+    # ── Scenario A vs B: <measure>_a / <measure>_b columns
+    if pairs:
+        return _compare_columns(df, [county_col, funcl_col, *text], pairs, values, q,
+                                chart_type, title)
+
+    # ── Pie: one measure split by a category
+    if chart_type == "pie":
+        pie_col = county_col or funcl_col or period_col or label_col
+        val_col = _primary(values, q)
+        if pie_col:
+            s = df.groupby(pie_col, sort=False)[val_col].sum()
+            labels, vals = [str(v) for v in s.index], s.tolist()
+        else:
+            labels, vals = [str(i + 1) for i in range(len(df))], df[val_col].tolist()
+        per_slice = _per_bar_colors(labels)
+        colors = (dict(zip(labels, per_slice)) if per_slice
+                  else FUNCL_COLORS if funcl_col and pie_col == funcl_col else None)
+        hole = 0.45 if any(k in q for k in ("donut", "doughnut")) else 0.0
+        return _pie_chart([(labels, vals, str(val_col))], title=title, colors=colors, hole=hole)
+
+    # ── Geography by time of day (AM / PM / OP / daily as columns or as rows)
+    if county_col and (has_wide_tod or has_long_tod):
+        if has_long_tod and not has_wide_tod:
+            val_col = _primary(values, q)
+            d = df.assign(**{period_col: df[period_col].astype(str).str.lower()})
+            if mentioned_tod:
+                d = d[d[period_col].isin(mentioned_tod)]
+            pivot = (d.groupby([county_col, period_col], sort=False)[val_col]
+                      .agg(agg_fn).unstack(level=1))
+            pivot = pivot.reindex(index=pd.unique(d[county_col].dropna()),
+                                  columns=[t for t in TOD_COLS if t in pivot.columns])
+            series = [(t, pivot[t], TOD_COLORS[t]) for t in pivot.columns]
+        else:
+            pivot = (df.dropna(subset=[county_col])
+                       .groupby(county_col, sort=False)[present_tod].agg(agg_fn))
+            series = [(c, pivot[c], tod_color(c)) for c in present_tod]
+        if pivot.empty or not series:
+            return None
+        return _category_chart(pivot.index, series, chart_type, x_title=str(county_col),
+                               y_title=_measure_title(df, "Value"),
+                               legend_title="Time of Day", title=title)
+
+    # ── Geography by functional class
+    if funcl_col and county_col:
+        val_col = next((c for c in values if str(c).lower() not in TOD_COLS),
+                       present_tod[0] if present_tod else values[0])
+        d = df[[county_col, funcl_col, val_col]].dropna()
+        pivot = (d.groupby([county_col, funcl_col], sort=False)[val_col]
+                  .sum().unstack(level=1))
+        pivot = pivot.reindex(index=pd.unique(d[county_col]),
+                              columns=sorted(pivot.columns, key=_funcl_order))
+        series = [(c, pivot[c], FUNCL_COLORS.get(c)) for c in pivot.columns]
+        return _category_chart(pivot.index, series, chart_type, x_title=str(county_col),
+                               y_title=str(val_col), legend_title="Functional class",
+                               title=title)
+
+    # ── Functional class by time of day (AM / PM / OP / daily as columns)
+    if funcl_col and has_wide_tod:
+        pivot = (df.dropna(subset=[funcl_col])
+                   .groupby(funcl_col, sort=False)[present_tod].sum())
+        series = [(c, pivot[c], tod_color(c)) for c in present_tod]
+        return _category_chart(pivot.index, series, chart_type, x_title="Functional class",
+                               y_title=_measure_title(df, "Value"),
+                               legend_title="Time of Day", title=title)
+
+    # ── Functional class by time of day (a period column)
+    if funcl_col and period_col:
+        val_col = _primary(values, q)
+        d = df[[funcl_col, period_col, val_col]].dropna()
+        pivot = (d.groupby([funcl_col, period_col], sort=False)[val_col]
+                  .sum().unstack(level=1))
+        periods = sorted(pivot.columns, key=lambda p: (
+            TOD_COLS.index(str(p).lower()) if str(p).lower() in TOD_COLS else len(TOD_COLS)))
+        pivot = pivot.reindex(index=pd.unique(d[funcl_col]), columns=periods)
+        series = [(p, pivot[p], TOD_COLORS.get(str(p).lower())) for p in periods]
+        return _category_chart(pivot.index, series, chart_type, x_title="Functional class",
+                               y_title=str(val_col), legend_title="Time of Day", title=title)
+
+    # ── One measure by functional class
+    if funcl_col:
+        val_col = next((c for c in values if str(c).lower() not in TOD_COLS), values[0])
+        s = (df[[funcl_col, val_col]].dropna()
+               .groupby(funcl_col, sort=False)[val_col].sum())
+        if wants_percent:
+            total = s.sum()
+            s = s / total * 100 if total > 0 else s * 0
+        return _category_chart(s.index, [(str(val_col), s, SERIES_COLORS[0])], chart_type,
+                               x_title="Functional class",
+                               y_title="Percent" if wants_percent else str(val_col),
+                               pct=wants_percent, title=title)
+
+    # ── One measure by time of day (a period column)
+    if period_col:
+        val_col = _primary(values, q)
+        s = (df[[period_col, val_col]].dropna()
+               .groupby(period_col, sort=False)[val_col].sum())
+        color = SERIES_COLORS[0] if chart_type == "line" else _per_bar_colors(s.index)
+        return _category_chart(s.index, [(str(val_col), s, color)], chart_type,
+                               x_title=str(period_col), y_title=str(val_col), title=title)
+
+    # ── Category column + measure(s)
+    if text:
+        x_col = label_col
+        d = df.dropna(subset=[x_col]).head(20)
+        primary = _primary(values, q)
+        cols = [primary] + [c for c in values
+                            if c != primary and _comparable(d, primary, c)][:3]
+        pct = pct_values or bool(_PCT_RE.search(str(primary)))
+        series = []
+        for c in cols:
+            v = pd.Series(_num_list(d[c]))
+            if pct:
+                v = v * 100 if v.abs().max() <= 1 else v
+            elif wants_percent:
+                total = v.sum()
+                v = v / total * 100 if total > 0 else v * 0
+            series.append((str(c), v, None))
+        pct = pct or wants_percent
+        x = d[x_col].astype(str).tolist()
+        if len(series) == 1:
+            per_bar = _per_bar_colors(x)
+            color = per_bar if per_bar and chart_type != "line" else SERIES_COLORS[0]
+            series = [(series[0][0], series[0][1], color)]
+        y_title = "Percent" if pct else (series[0][0] if len(series) == 1 else "Value")
+        return _category_chart(x, series, chart_type, x_title="" if unpivoted else str(x_col),
+                               y_title=y_title, pct=pct, title=title)
+
+    # ── One measure, no categories: its distribution
+    if len(values) == 1:
+        return _histogram_chart(df[values[0]], values[0])
+
+    # ── Fallback: up to three measures by row
+    series = [(str(c), df[c], SERIES_COLORS[i]) for i, c in enumerate(values[:3])]
+    return _category_chart(list(range(1, len(df) + 1)), series, "line", x_title="Row",
+                           title=title)
+
+
+# Charts are rendered locally; no data is sent to the model for charting.
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.route("/upload", methods=["POST"])
+def upload():
+    """Upload OMX trip/skim files (existing functionality)."""
+    try:
+        trip_file = request.files.get("trip")
+        skim_file = request.files.get("skim")
+        if not trip_file:
+            return jsonify({"error": "Trip OMX required"}), 400
+
+        with DB_LOCK:
+            conn = sqlite3.connect(":memory:", check_same_thread=False)
+            info = {}
+
+            with tempfile.NamedTemporaryFile(suffix=".omx", delete=False) as t:
+                trip_file.save(t.name)
+                cores, zones = load_omx_trips(t.name, conn)
+                info["trip_cores"] = cores
+                info["zones"]      = zones
+            os.unlink(t.name)
+
+            if skim_file:
+                with tempfile.NamedTemporaryFile(suffix=".omx", delete=False) as s:
+                    skim_file.save(s.name)
+                    info["skim_core"] = load_omx_skim(s.name, conn)
+                os.unlink(s.name)
+
+            DB["conn"]   = conn
+            DB["schema"] = get_schema(conn)
+            purposes     = pd.read_sql(
+                "SELECT purpose, SUM(trips) as total FROM trips GROUP BY purpose", conn)
+            info["purposes"] = purposes.to_dict(orient="records")
+
+        return jsonify({"ok": True, "info": info})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/list_model_runs", methods=["GET"])
+def list_model_runs():
+    """Return subdirectory names under MODEL_RUNS_ROOT."""
+    try:
+        if not os.path.isdir(MODEL_RUNS_ROOT):
+            return jsonify({"error": f"Folder not found: {MODEL_RUNS_ROOT}"}), 404
+        folders = sorted(
+            d for d in os.listdir(MODEL_RUNS_ROOT)
+            if os.path.isdir(os.path.join(MODEL_RUNS_ROOT, d))
+        )
+        return jsonify({"folders": folders})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _load_scenario_into_slot(folder, slot):
+    """Load a scenario folder into DB slot 'A' or 'B'. Returns summary dict."""
+    base = os.path.join(MODEL_RUNS_ROOT, folder, "Reports", "ModelRunReports")
+    if not os.path.isdir(base):
+        raise FileNotFoundError(f"ModelRunReports folder not found: {base}")
+
+    with DB_LOCK:
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
+        summary = load_scenario_data(folder, conn)
+        DB[slot]["conn"]   = conn
+        DB[slot]["schema"] = get_schema(conn)
+        DB[slot]["folder"] = folder
+
+    return conn, summary
+
+
+def _scenario_summary(conn, folder, summary):
+    tables_loaded = list(summary.keys())
+    total_rows    = sum(summary.values())
+    counties = []
+    try:
+        df_c = pd.read_sql("SELECT DISTINCT COUNTY FROM county_demographics ORDER BY COUNTY", conn)
+        counties = df_c["COUNTY"].tolist()
+    except Exception:
+        pass
+    cities_count = 0
+    try:
+        df_ci = pd.read_sql("SELECT COUNT(DISTINCT CITY) as n FROM city_demographics", conn)
+        cities_count = int(df_ci["n"].iloc[0])
+    except Exception:
+        pass
+    sections = []
+    for tbl in ["county_perfmeasures", "city_perfmeasures", "mpa_perfmeasures"]:
+        try:
+            df_s = pd.read_sql(f"SELECT DISTINCT section FROM {tbl} ORDER BY section", conn)
+            sections = df_s["section"].tolist()
+            break
+        except Exception:
+            pass
+    print(f"Scenario loaded: {folder}, {total_rows:,} total rows across {len(tables_loaded)} tables")
+    return {
+        "ok":           True,
+        "folder":       folder,
+        "tables":       tables_loaded,
+        "total_rows":   total_rows,
+        "counties":     sorted(counties),
+        "cities_count": cities_count,
+        "sections":     sorted(sections),
+        "summary":      summary,
+    }
+
+
+@app.route("/load_scenario", methods=["POST"])
+def load_scenario():
+    """Legacy single-slot load — loads into slot A."""
+    try:
+        data   = request.json
+        folder = data.get("folder", "").strip()
+        if not folder:
+            return jsonify({"error": "No folder specified"}), 400
+        conn, summary = _load_scenario_into_slot(folder, "A")
+        return jsonify(_scenario_summary(conn, folder, summary))
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/load_scenario_slot", methods=["POST"])
+def load_scenario_slot():
+    """
+    Body: { "slot": "A" | "B", "folder": "M50_APR26_..." }
+    Loads a model run into the specified slot.
+    """
+    try:
+        data   = request.json
+        slot   = data.get("slot", "").strip().upper()
+        folder = data.get("folder", "").strip()
+        if slot not in ("A", "B"):
+            return jsonify({"error": "slot must be 'A' or 'B'"}), 400
+        if not folder:
+            return jsonify({"error": "No folder specified"}), 400
+        conn, summary = _load_scenario_into_slot(folder, slot)
+        result = _scenario_summary(conn, folder, summary)
+        result["slot"] = slot
+        return jsonify(result)
+    except FileNotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+# Keep the old /load_perf route alive so any existing bookmarks still work
+@app.route("/load_perf", methods=["POST"])
+def load_perf():
+    return load_scenario()
+
+
+# ── Debug routes ──────────────────────────────────────────────────────────────
+@app.route("/debug/tables", methods=["GET"])
+def debug_tables():
+    """List all tables and row counts in the database."""
+    try:
+        with DB_LOCK:
+            conn = DB["A"]["conn"]
+        if conn is None:
+            return jsonify({"error": "No data loaded"}), 400
+        
+        df = pd.read_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+            conn
+        )
+        tables = df["name"].tolist()
+        
+        result = {}
+        for table in tables:
+            try:
+                count_df = pd.read_sql(f"SELECT COUNT(*) as cnt FROM {table}", conn)
+                result[table] = int(count_df["cnt"].iloc[0])
+            except:
+                result[table] = "ERROR"
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/perf_sections", methods=["GET"])
+def debug_perf_sections():
+    """List all sections in perf measure tables."""
+    try:
+        with DB_LOCK:
+            conn = DB["A"]["conn"]
+        if conn is None:
+            return jsonify({"error": "No data loaded"}), 400
+        
+        result = {}
+        for table_prefix in ["county_perfmeasures", "city_perfmeasures", "mpa_perfmeasures"]:
+            try:
+                df = pd.read_sql(
+                    f"SELECT DISTINCT section FROM {table_prefix} ORDER BY section",
+                    conn
+                )
+                result[table_prefix] = df["section"].tolist()
+            except:
+                result[table_prefix] = []
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/lane_miles", methods=["GET"])
+def debug_lane_miles():
+    """Show actual lane miles data from database."""
+    try:
+        with DB_LOCK:
+            conn = DB["A"]["conn"]
+        if conn is None:
+            return jsonify({"error": "No data loaded"}), 400
+        
+        # Try to find Lane Miles records
+        df = pd.read_sql(
+            """SELECT * FROM county_perfmeasures 
+               WHERE section LIKE '%Lane%' OR description LIKE '%Lane%'
+               LIMIT 50""",
+            conn
+        )
+        
+        return jsonify({
+            "columns": list(df.columns),
+            "rows": df.to_dict(orient="records"),
+            "row_count": len(df)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/perf_schema", methods=["GET"])
+def debug_perf_schema():
+    """Show schema of perf measure tables."""
+    try:
+        with DB_LOCK:
+            conn = DB["A"]["conn"]
+        if conn is None:
+            return jsonify({"error": "No data loaded"}), 400
+        
+        result = {}
+        for table in ["county_perfmeasures", "city_perfmeasures", "mpa_perfmeasures"]:
+            try:
+                df = pd.read_sql(f"PRAGMA table_info({table})", conn)
+                result[table] = df.to_dict(orient="records")
+            except:
+                result[table] = []
+        
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/debug/test_sql", methods=["POST"])
+def debug_test_sql():
+    """Execute a test SQL query and return results."""
+    try:
+        data = request.json
+        sql = data.get("sql", "").strip()
+        if not sql:
+            return jsonify({"error": "No SQL provided"}), 400
+        
+        with DB_LOCK:
+            conn = DB["A"]["conn"]
+        if conn is None:
+            return jsonify({"error": "No data loaded"}), 400
+        
+        df, error = run_query(sql, conn)
+        if error:
+            return jsonify({"error": error}), 400
+        return jsonify({
+            "sql": sql,
+            "rows": df.to_dict(orient="records"),
+            "row_count": len(df),
+            "columns": list(df.columns)
+        })
+    except Exception as e:
+        return jsonify({"error": str(e), "sql": data.get("sql", "")}), 500
+
+
+@app.route("/debug/county_comparison", methods=["GET"])
+def debug_county_comparison():
+    """
+    Compare single-county vs all-counties queries for LOS F percentage.
+    Shows what data exists and why all-counties might return empty.
+    """
+    try:
+        with DB_LOCK:
+            conn = DB["A"]["conn"]
+        if conn is None:
+            return jsonify({"error": "No data loaded"}), 400
+        
+        # Get available counties
+        counties_df = pd.read_sql(
+            "SELECT DISTINCT COUNTY FROM county_perfmeasures ORDER BY COUNTY",
+            conn
+        )
+        counties = counties_df["COUNTY"].tolist() if len(counties_df) > 0 else []
+        
+        # Get LOS F records
+        los_f_df = pd.read_sql(
+            "SELECT DISTINCT COUNTY, section, description FROM county_perfmeasures "
+            "WHERE description LIKE '%LOS F%' OR description LIKE '%LOS%' "
+            "ORDER BY COUNTY, section, description LIMIT 20",
+            conn
+        )
+        
+        # Try the actual queries that might be failing
+        single_county = None
+        all_counties = None
+        
+        if counties:
+            test_county = counties[0]
+            try:
+                single_df = pd.read_sql(
+                    f"""SELECT COUNTY, description, daily 
+                       FROM county_perfmeasures 
+                       WHERE COUNTY = '{test_county}' 
+                       AND (description LIKE '%LOS F%' OR description LIKE '%Percent%Lane%')
+                       LIMIT 10""",
+                    conn
+                )
+                single_county = {
+                    "query": f"WHERE COUNTY = '{test_county}'",
+                    "rows": single_df.to_dict(orient="records"),
+                    "count": len(single_df)
+                }
+            except Exception as e:
+                single_county = {"error": str(e)}
+            
+            try:
+                all_df = pd.read_sql(
+                    """SELECT COUNTY, description, daily 
+                       FROM county_perfmeasures 
+                       WHERE (description LIKE '%LOS F%' OR description LIKE '%Percent%Lane%')
+                       GROUP BY COUNTY, description
+                       LIMIT 20""",
+                    conn
+                )
+                all_counties = {
+                    "query": "WHERE description LIKE '%LOS F%' GROUP BY COUNTY",
+                    "rows": all_df.to_dict(orient="records"),
+                    "count": len(all_df)
+                }
+            except Exception as e:
+                all_counties = {"error": str(e)}
+        
+        return jsonify({
+            "counties": counties,
+            "los_f_records_sample": los_f_df.to_dict(orient="records"),
+            "single_county_test": single_county,
+            "all_counties_test": all_counties
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _build_compare_db():
+    """
+    Merge DB slot A and B into a temporary in-memory SQLite database.
+    Tables from slot A are attached as <name>_a, slot B as <name>_b.
+    Returns (merged_conn, merged_schema) or raises if either slot is empty.
+    """
+    conn_a = DB["A"]["conn"]
+    conn_b = DB["B"]["conn"]
+    if conn_a is None or conn_b is None:
+        raise ValueError("Both scenario A and B must be loaded before comparing.")
+
+    merged = sqlite3.connect(":memory:", check_same_thread=False)
+
+    def _copy_tables(src, suffix):
+        cur = src.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        for (tname,) in cur.fetchall():
+            df = pd.read_sql(f"SELECT * FROM {tname}", src)
+            df.to_sql(f"{tname}_{suffix}", merged, if_exists="replace", index=False)
+
+    _copy_tables(conn_a, "a")
+    _copy_tables(conn_b, "b")
+    merged.commit()
+
+    schema = get_schema(merged)
+    folder_a = DB["A"]["folder"] or "Scenario A"
+    folder_b = DB["B"]["folder"] or "Scenario B"
+    header = (
+        f"COMPARISON MODE — two scenarios loaded:\n"
+        "  Scenario A → tables suffixed _a  (e.g. county_demographics_a)\n"
+        "  Scenario B → tables suffixed _b  (e.g. county_demographics_b)\n"
+        f"To compare, JOIN on the geography key or use subqueries / UNION ALL.\n"
+        f"Example: SELECT a.COUNTY, a.EMP as emp_a, b.EMP as emp_b, (b.EMP - a.EMP) as delta\n"
+        f"         FROM county_demographics_a a JOIN county_demographics_b b USING(COUNTY)\n\n"
+    )
+    return merged, header + schema, folder_a, folder_b
+
+
+def _compare_summarize(question, sql, df, folder_a, folder_b):
+    local = f"Scenario A: {folder_a}; Scenario B: {folder_b}. " + _local_result_summary(df)
+    if not LLM_SEND_RESULTS or df.empty:
+        return local
+    return _llm_summary(
+        f"Comparing Scenario A = {folder_a} and Scenario B = {folder_b}.\n"
+        f"User asked: {question}\nSQL: {sql}\nResult:\n{_result_text(df, question)}\n"
+        "Summarize key differences in 3-5 sentences; include absolute and percent "
+        "changes where applicable and specific numbers. " + SUMMARY_STYLE,
+        700, local)
+
+
+@app.route("/ask", methods=["POST"])
+def ask():
+    try:
+        data     = request.json
+        question = data.get("question", "").strip()
+        compare  = bool(data.get("compare", False))
+        if not question:
+            return jsonify({"error": "No question"}), 400
+
+        if compare:
+            with DB_LOCK:
+                try:
+                    merged_conn, schema, folder_a, folder_b = _build_compare_db()
+                except ValueError as ve:
+                    return jsonify({"error": str(ve)}), 400
+            df, sql, attempts, error = run_with_retry(question, schema, merged_conn)
+            if error:
+                return jsonify({"error": _query_error(error, attempts, merged_conn,
+                                                      {"A": folder_a, "B": folder_b}),
+                                "sql": sql})
+            answer = _compare_summarize(question, sql, df, folder_a, folder_b)
+        else:
+            slot = data.get("slot", "A").strip().upper()
+            if slot not in ("A", "B"):
+                slot = "A"
+            with DB_LOCK:
+                conn   = DB[slot]["conn"]
+                schema = DB[slot]["schema"]
+                folder = DB[slot]["folder"]
+            if conn is None:
+                slot_label = "base" if slot == "A" else "alternative"
+                return jsonify({"error": f"No {slot_label} scenario loaded. Select and load a scenario first."}), 400
+            df, sql, attempts, error = run_with_retry(question, schema, conn)
+            if error:
+                return jsonify({"error": _query_error(error, attempts, conn, {slot: folder}),
+                                "sql": sql})
+            answer = summarize(question, sql, df)
+
+        chart_keywords = ["chart", "plot", "graph", "visuali", "bar", "histogram",
+                          "distribution", "show me", "compare"]
+        wants_chart = any(k in question.lower() for k in chart_keywords)
+        chart_type  = detect_chart_type(question) if wants_chart else "bar"
+        chart = None
+        if wants_chart:
+            try:
+                chart = make_chart(df, question, chart_type)
+            except Exception:
+                import traceback
+                traceback.print_exc()   # an odd result shape shouldn't cost the answer
+
+        df_clean = df.head(50).where(pd.notnull(df.head(50)), other=None)
+        rows = df_clean.to_dict(orient="records")
+        cols = list(df.columns)
+        return jsonify({"answer": answer, "sql": sql, "attempts": attempts,
+                        "chart": chart, "rows": rows, "cols": cols, "total_rows": len(df)})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/")
+def index():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    with open(os.path.join(base_dir, "chatbot_vllm_qwen3.html"), "r", encoding="utf-8") as f:
+        html = f.read()
+    return Response(html, mimetype="text/html", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "Pragma": "no-cache",
+    })
+
+
+@functools.lru_cache(maxsize=1)
+def _plotly_js():
+    return get_plotlyjs()
+
+
+@app.route("/plotly.min.js")
+def plotly_js():
+    """plotly.js from the installed plotly package, so the page and downloaded charts
+    use the version the figures are built for, with no CDN needed."""
+    resp = Response(_plotly_js(), mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.set_etag(f"plotly-{get_plotlyjs_version()}")
+    return resp.make_conditional(request)
+
+
+@app.route("/health")
+def health():
+    return jsonify({
+        "ok": True,
+        "slot_a": DB["A"]["conn"] is not None,
+        "slot_b": DB["B"]["conn"] is not None,
+        "folder_a": DB["A"]["folder"],
+        "folder_b": DB["B"]["folder"],
+    })
+
+
+def open_browser():
+    webbrowser.open("http://127.0.0.1:5050")
+
+
+def _port_in_use(host, port):
+    # On Windows the dev server binds with SO_REUSEADDR, so a second copy starts without
+    # error and the browser's requests land on either copy (old code or new, at random).
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1)
+        return s.connect_ex((host, port)) == 0
+
+
+if __name__ == "__main__":
+    if _port_in_use("127.0.0.1", 5050):
+        msg = ("Port 5050 is already in use, most likely by another copy of this server "
+               "(copies started with pythonw.exe have no window; end them in Task Manager). "
+               "Stop it first so the browser doesn't reach the old code.")
+        if sys.stderr is None:                  # pythonw.exe: no console to print to
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg, "NCT chatbot server", 0x10)
+        sys.exit(msg)
+    if os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        Timer(1.5, open_browser).start()
+    app.run(host="127.0.0.1", port=5050, debug=False, threaded=True,
+            extra_files=[], exclude_patterns=["*.venv*", "*site-packages*"])
